@@ -19,10 +19,22 @@ import httpx
 from openai import AsyncOpenAI
 from ..core.database import settings
 
-import riva.client
-import grpc
-import av
 import io
+
+try:
+    import riva.client as riva_client
+except Exception:  # pragma: no cover
+    riva_client = None
+
+try:
+    import grpc
+except Exception:  # pragma: no cover
+    grpc = None
+
+try:
+    import av
+except Exception:  # pragma: no cover
+    av = None
 
 logger = logging.getLogger(__name__)
 
@@ -147,7 +159,10 @@ def _build_riva_metadata() -> list[tuple[str, str]]:
     return metadata
 
 
-def _classify_grpc_error(error: grpc.RpcError) -> AsrServiceError:
+def _classify_grpc_error(error: Exception) -> AsrServiceError:
+    if grpc is None or not hasattr(error, "code"):
+        return AsrUnavailableError(f"Primary ASR provider unavailable: {error}", source="riva")
+
     status = error.code()
     details = error.details() or ""
     if status in {grpc.StatusCode.UNAVAILABLE, grpc.StatusCode.DEADLINE_EXCEEDED}:
@@ -321,9 +336,15 @@ def _get_riva_auth():
     """
     Constructs the Riva Auth object with NVCF metadata.
     """
+    if riva_client is None or grpc is None:
+        raise AsrUnavailableError(
+            "Riva ASR dependencies are not installed in this deployment.",
+            source="riva",
+        )
+
     try:
         _ = _build_riva_metadata()
-        auth = riva.client.Auth(
+        auth = riva_client.Auth(
             uri=settings.AI_ASR_URL or "grpc.nvcf.nvidia.com:443",
             use_ssl=True
         )
@@ -342,11 +363,17 @@ def _normalize_language_code() -> str:
 
 
 def _transcribe_with_riva(pcm_data: bytes) -> str:
-    auth = _get_riva_auth()
-    asr_service = riva.client.ASRService(auth)
+    if riva_client is None or grpc is None:
+        raise AsrUnavailableError(
+            "Riva ASR dependencies are not installed in this deployment.",
+            source="riva",
+        )
 
-    config = riva.client.RecognitionConfig(
-        encoding=riva.client.AudioEncoding.LINEAR_PCM,
+    auth = _get_riva_auth()
+    asr_service = riva_client.ASRService(auth)
+
+    config = riva_client.RecognitionConfig(
+        encoding=riva_client.AudioEncoding.LINEAR_PCM,
         sample_rate_hertz=16000,
         language_code=_normalize_language_code(),
         max_alternatives=1,
@@ -355,7 +382,7 @@ def _transcribe_with_riva(pcm_data: bytes) -> str:
     )
 
     metadata = _build_riva_metadata()
-    request = riva.client.proto.riva_asr_pb2.RecognizeRequest(
+    request = riva_client.proto.riva_asr_pb2.RecognizeRequest(
         config=config,
         audio=pcm_data,
     )
@@ -401,6 +428,12 @@ async def _transcribe_with_openai(audio_bytes: bytes) -> str:
         await client.close()
 
 def _convert_to_pcm(audio_bytes: bytes) -> bytes:
+    if av is None:
+        raise AsrUnavailableError(
+            "Audio conversion dependency 'av' is not installed in this deployment.",
+            source="audio",
+        )
+
     try:
         if not audio_bytes or len(audio_bytes) < 10:
             logger.error(f"Audio payload too small: {len(audio_bytes)} bytes.")
@@ -452,6 +485,11 @@ async def transcribe_attendance_audio(audio_bytes: bytes) -> str:
     """
     try:
         logger.info(f"Starting ASR transcription: {len(audio_bytes)} bytes received.")
+
+        # If PyAV is unavailable, skip Riva path and use OpenAI fallback directly.
+        if av is None:
+            logger.warning("PyAV not installed; routing ASR directly to fallback provider.")
+            return await _transcribe_with_openai(audio_bytes)
         
         # 1. Convert to Mono PCM 16kHz
         try:
