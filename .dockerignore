@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.venv
+venv
+ENV
+.env
+
+# Git
+.git
+.gitignore
+
+# Local data and logs
+data/
+profiles/
+error_log.txt
+*.log
+
+# Documentation and IDE
+README.md
+.vscode
+.idea
+Dockerfile
+.dockerignore
