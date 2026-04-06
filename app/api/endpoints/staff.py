@@ -453,6 +453,7 @@ async def submit_period_attendance(
                     status=status,
                     marked_by_faculty_id=current_user.id,
                     is_substitute=is_substitute,
+                    semester=attendance_data.semester,
                 )
             )
         else:
@@ -464,6 +465,7 @@ async def submit_period_attendance(
                 status=status,
                 marked_by_faculty_id=current_user.id,
                 is_substitute=is_substitute,
+                semester=attendance_data.semester,
             ))
 
     await db.commit()

@@ -255,6 +255,7 @@ class PeriodAttendance(Base):
     is_substitute = Column(Boolean, default=False)
     created_at = Column(TIMESTAMP, server_default=text("CURRENT_TIMESTAMP"))
     updated_at = Column(TIMESTAMP, server_default=text("CURRENT_TIMESTAMP"), onupdate=text("CURRENT_TIMESTAMP"))
+    semester = Column(Integer, nullable=False)
     updated_by = Column(Integer, ForeignKey("users.id"), nullable=True)
 
     __table_args__ = (
