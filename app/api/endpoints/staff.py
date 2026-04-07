@@ -225,24 +225,27 @@ async def get_subject_students(
     result = await db.execute(select(models.Subject).filter(models.Subject.id == subject_id))
     subject = result.scalars().first()
 
-    # Fetch students. 
-    # Use the subject's semester as target, but allow sem-1 mismatch (for transitions)
+    # Determine the section to filter by:
+    # explicit query param > assignment.section
+    effective_section = section or assignment.section
+
+    # Fetch students filtered by program, semester AND section
     query = select(models.Student).filter(
         models.Student.program_id == subject.program_id,
         models.Student.current_semester.in_([subject.semester, subject.semester - 1])
     )
-    
+    if effective_section:
+        query = query.filter(models.Student.section == effective_section)
+
     # Execute and fetch students
     result = await db.execute(query)
     students = result.scalars().all()
 
-    # Fallback to just program_id if still nothing found
+    # Fallback: if nothing found, try just program_id + section
     if not students:
         fallback_query = select(models.Student).filter(models.Student.program_id == subject.program_id)
-        if section:
-            fallback_query = fallback_query.filter(models.Student.section == section)
-        elif assignment.section:
-            fallback_query = fallback_query.filter(models.Student.section == assignment.section)
+        if effective_section:
+            fallback_query = fallback_query.filter(models.Student.section == effective_section)
         result = await db.execute(fallback_query)
         students = result.scalars().all()
     
@@ -403,21 +406,32 @@ async def submit_period_attendance(
         .filter(models.FacultySubjectAssignment.faculty_id == current_user.id)
         .filter(models.FacultySubjectAssignment.subject_id == attendance_data.subject_id)
     )
-    is_substitute = assignment_res.scalars().first() is None
+    assignment = assignment_res.scalars().first()
+    is_substitute = assignment is None
 
-    # Fetch students in this program. 
-    # Use the subject's semester as target, but allow sem-1 mismatch (for transitions)
-    students_res = await db.execute(
+    # Determine the section to use:
+    # 1. Explicit section from the request body (frontend dropdown) takes highest priority
+    # 2. Fall back to the assignment's section (for regular faculty)
+    # 3. No filter for substitutes (they chose "All")
+    section_filter = attendance_data.section or (assignment.section if (assignment and assignment.section) else None)
+
+    # Fetch students by program + semester (+ section for regular faculty)
+    student_query = (
         select(models.Student)
         .filter(models.Student.program_id == subject.program_id)
         .filter(models.Student.current_semester.in_([attendance_data.semester, attendance_data.semester - 1]))
     )
+    if section_filter:
+        student_query = student_query.filter(models.Student.section == section_filter)
+
+    students_res = await db.execute(student_query)
     students = students_res.scalars().all()
     if not students:
-        # Fallback to just program_id if still nothing found
-        students_res = await db.execute(
-            select(models.Student).filter(models.Student.program_id == subject.program_id)
-        )
+        # Fallback to just program_id (+ section if applicable)
+        fallback_query = select(models.Student).filter(models.Student.program_id == subject.program_id)
+        if section_filter:
+            fallback_query = fallback_query.filter(models.Student.section == section_filter)
+        students_res = await db.execute(fallback_query)
         students = students_res.scalars().all()
 
     if not students:
@@ -470,16 +484,115 @@ async def submit_period_attendance(
 
     await db.commit()
     sub_note = " (marked as substitute)" if is_substitute else ""
-    
-    # Notify all students about the attendance update
-    subject_name = subject.course_code if subject else "Unknown Subject"
+
+    # ── Compute stats for broadcast ───────────────────────────────────────────
+    absentees_set_upper = {r.strip().upper() for r in attendance_data.absentees if r.strip()}
+    od_set_upper = {r.strip().upper() for r in getattr(attendance_data, 'od_list', []) if r.strip()}
+    present_count = sum(
+        1 for s in students
+        if s.roll_no.strip().upper() not in absentees_set_upper
+        and s.roll_no.strip().upper() not in od_set_upper
+    )
+    absent_count = len([s for s in students if s.roll_no.strip().upper() in absentees_set_upper])
+    od_count = len([s for s in students if s.roll_no.strip().upper() in od_set_upper])
+    total_count = len(students)
+
+    # ── Fetch faculty name ───────────────────────────────────────────────────
+    faculty_res = await db.execute(select(models.Staff).filter(models.Staff.id == current_user.id))
+    faculty = faculty_res.scalars().first()
+    faculty_name = faculty.name if faculty else current_user.username
+
+    # ── Notify admins + submitting staff (broadcast) ─────────────────────────
+    await websocket.notify_attendance_broadcast(
+        faculty_id=current_user.id,
+        faculty_name=faculty_name,
+        subject_name=subject.name,
+        subject_code=subject.course_code,
+        period=attendance_data.period,
+        date=str(attendance_data.date),
+        section=section_filter,
+        semester=attendance_data.semester,
+        present_count=present_count,
+        absent_count=absent_count,
+        od_count=od_count,
+        total_count=total_count,
+        is_substitute=is_substitute,
+    )
+
+    # ── Notify each student individually ─────────────────────────────────────
     for student in students:
         await websocket.notify_student_attendance_updated(
             student.roll_no,
-            f"Attendance marked for {subject_name}, Period {attendance_data.period} on {attendance_data.date}"
+            f"Attendance marked for {subject.course_code}, Period {attendance_data.period} on {attendance_data.date}"
         )
-    
+
     return schemas.MessageResponse(message=f"Attendance submitted successfully{sub_note}")
+
+
+@router.get(
+    "/attendance/records",
+    summary="Fetch Attendance Records for a Session",
+    description="Returns per-student attendance status for a given subject, date, period, and optional section. Used for viewing and editing past attendance.",
+)
+async def get_attendance_records(
+    subject_id: int = Query(..., description="Subject ID"),
+    date: str = Query(..., description="Date in YYYY-MM-DD format"),
+    period: int = Query(..., ge=1, le=7, description="Period number (1-7)"),
+    section: Optional[str] = Query(None, description="Section filter (A/B)"),
+    db: AsyncSession = Depends(get_db),
+    current_user: models.User = Depends(auth.get_current_user),
+):
+    verify_staff_access(current_user)
+
+    from datetime import date as dt_date
+    query_date = dt_date.fromisoformat(date)
+
+    # Fetch subject info for program/semester
+    subject_res = await db.execute(select(models.Subject).filter(models.Subject.id == subject_id))
+    subject = subject_res.scalars().first()
+    if not subject:
+        raise HTTPException(status_code=404, detail="Subject not found")
+
+    # Fetch students for this subject (with optional section filter)
+    student_query = (
+        select(models.Student)
+        .filter(models.Student.program_id == subject.program_id)
+    )
+    if section:
+        student_query = student_query.filter(models.Student.section == section)
+
+    students_res = await db.execute(student_query)
+    students = students_res.scalars().all()
+
+    # Build roll_no → student map
+    student_map = {s.id: s for s in students}
+    student_ids = list(student_map.keys())
+
+    # Fetch existing attendance records for this session
+    records_res = await db.execute(
+        select(models.PeriodAttendance)
+        .filter(
+            models.PeriodAttendance.subject_id == subject_id,
+            models.PeriodAttendance.date == query_date,
+            models.PeriodAttendance.period == period,
+            models.PeriodAttendance.student_id.in_(student_ids),
+        )
+    )
+    records = {r.student_id: r for r in records_res.scalars().all()}
+
+    result = []
+    for student in students:
+        rec = records.get(student.id)
+        result.append({
+            "roll_no": student.roll_no,
+            "name": student.name,
+            "section": student.section,
+            "status": rec.status if rec else None,  # None means not yet marked
+            "is_marked": rec is not None,
+        })
+
+    result.sort(key=lambda x: x["roll_no"])
+    return result
 
 
 @router.get(

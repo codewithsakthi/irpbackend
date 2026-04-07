@@ -187,6 +187,7 @@ class PeriodAttendanceCreate(BaseModel):
     absentees: List[str] = Field(default_factory=list, description="Roll numbers of absent students")
     od_list: List[str] = Field(default_factory=list, description="Roll numbers of 'On Duty' students")
     semester: int
+    section: Optional[str] = Field(default=None, description="Section filter (e.g. 'A' or 'B'). If provided, overrides the assignment's section.")
 
 
 class SubjectAttendanceRow(BaseModel):

@@ -785,13 +785,8 @@ async def export_batch_summary(
     db: AsyncSession = Depends(get_db)
 ):
     require_admin(current_user)
-    # The service returns bytes or a file object
-    content = await enterprise_analytics.export_batch_summary_xlsx(db, CURRICULUM_CREDITS, cgpa_threshold=cgpa_threshold)
-    return Response(
-        content=content, 
-        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        headers={"Content-Disposition": "attachment; filename=batch_summary.xlsx"}
-    )
+    # The service returns a StreamingResponse directly
+    return await enterprise_analytics.export_batch_summary_xlsx(db, CURRICULUM_CREDITS, cgpa_threshold=cgpa_threshold)
 
 @router.get(
     "/export/grade-sheet/{roll_no}",
