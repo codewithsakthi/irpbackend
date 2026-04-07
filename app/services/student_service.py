@@ -412,9 +412,9 @@ class StudentService:
                 }
             
             if ass.assessment_type.startswith('CIT'):
-                subject_buckets[key]['CIT'].append(ass.marks or 0.0)
+                subject_buckets[key]['CIT'].append(float(ass.marks or 0.0))
             elif ass.assessment_type == 'SEMESTER_EXAM':
-                subject_buckets[key]['EXAM'] = ass.marks
+                subject_buckets[key]['EXAM'] = float(ass.marks) if ass.marks is not None else None
                 subject_buckets[key]['grade'] = getattr(ass, 'grade', None)
                 subject_buckets[key]['result_status'] = getattr(ass, 'result_status', None)
 
@@ -440,7 +440,7 @@ class StudentService:
         average_grade_points = round(total_credit_points / total_credits, 2) if total_credits > 0 else 0.0
 
         # Internals
-        internals = [ass.marks for ass in assessments if ass.assessment_type.startswith('CIT') and ass.marks is not None]
+        internals = [float(ass.marks) for ass in assessments if ass.assessment_type.startswith('CIT') and ass.marks is not None]
         average_internal = round(sum(internals) / len(internals), 2) if internals else 0.0
 
         # Backlogs: count only explicitly failed final semester exams.
@@ -474,25 +474,53 @@ class StudentService:
         # Semester Performance (Rollup)
         # Note: If semester is filtered, this list will only contain that semester or be derived accordingly.
         semester_perf_map = {}
-        for row in att_rows:
-            sem = int(row.get("semester") or 0)
+        
+        # Populate from subject_buckets which contains the aggregated marks/grades
+        for key, data in subject_buckets.items():
+            sem = data['semester']
             if sem not in semester_perf_map:
                 semester_perf_map[sem] = {
                     "count": 0,
                     "internal_sum": 0,
                     "internal_count": 0,
-                    "gp_sum": 0,
-                    "gp_count": 0,
+                    "gp_sum": 0.0,
+                    "credits_sum": 0.0,
                     "backlogs": 0
                 }
-            # We can enrich this if we have more data, but for now we populate from what's available
-        
+            
+            group = semester_perf_map[sem]
+            group["count"] += 1
+            
+            # Internals
+            if data['CIT']:
+                avg_cit = sum(data['CIT']) / len(data['CIT'])
+                group["internal_sum"] += avg_cit
+                group["internal_count"] += 1
+            
+            # Grade Points & Credits
+            credits = CURRICULUM_CREDITS.get(data['subject'].course_code, data['subject'].credits or 0.0)
+            gp = grade_point_from_grade(data['grade'])
+            
+            # Fallback to derivation from marks if grade is missing but exam marks are present
+            if gp is None and data['EXAM'] is not None:
+                gp = data['EXAM'] / 10.0
+            
+            if gp is not None and credits > 0:
+                group["gp_sum"] += float(credits) * float(gp)
+                group["credits_sum"] += float(credits)
+
+            # Backlogs
+            status = str(data['result_status'] or "").strip().upper()
+            grade = str(data['grade'] or "").strip().upper()
+            if status in fail_statuses or grade in fail_grades:
+                group["backlogs"] += 1
+
         semester_performance = [
             schemas.SemesterPerformanceItem(
                 semester=s,
                 subject_count=data["count"],
-                average_internal=round(data["internal_sum"]/data["internal_count"], 2) if data["internal_count"] > 0 else 0.0,
-                average_grade_points=round(data["gp_sum"]/data["gp_count"], 2) if data["gp_count"] > 0 else 0.0,
+                average_internal=round(data["internal_sum"] / data["internal_count"], 2) if data["internal_count"] > 0 else 0.0,
+                average_grade_points=round(data["gp_sum"] / data["credits_sum"], 2) if data["credits_sum"] > 0 else 0.0,
                 backlog_count=data["backlogs"]
             )
             for s, data in sorted(semester_perf_map.items())
@@ -578,8 +606,7 @@ class StudentService:
         analytics = await cls.calculate_analytics(student, db, semester)
         risk = await cls.calculate_student_risk(student, db, semester)
         
-        # This will be fully implemented when AdminService is ready to provide rankings efficiently.
-        # For now, placeholder for metrics
+        # Populate metrics
         gpa_trend = 0.0
         placement_readiness = 80.0 # Placeholder
         
@@ -641,8 +668,45 @@ class StudentService:
                 detail="Your academic profile looks strong! Keep up the consistent performance.",
                 tone="positive"
             ))
-        # Clamp risk score to [0, 100]
-        risk_score = max(0, min(100, risk.risk_score))
+
+        # Recent Results
+        marks = await cls.get_report_card_marks(student.id, db)
+        recent_results: List[schemas.SemesterGradeRecord] = []
+        for m in sorted(marks, key=lambda x: (x.semester, x.subject.name), reverse=True)[:10]:
+            recent_results.append(
+                schemas.SemesterGradeRecord(
+                    semester=m.semester,
+                    subject_code=m.subject.course_code,
+                    subject_name=m.subject.name,
+                    subject_title=m.subject.name,
+                    credits=m.subject.credits,
+                    grade=m.grade,
+                    marks=m.total_marks,
+                    internal_marks=m.internal_marks,
+                    attempt=m.attempt,
+                    remarks=m.remarks,
+                    grade_point=grade_point_from_grade(m.grade),
+                )
+            )
+
+        # Record Health
+        contact_info = (await db.execute(select(models.ContactInfo).filter(models.ContactInfo.student_id == student.id))).scalars().first()
+        family_details = (await db.execute(select(models.FamilyDetail).filter(models.FamilyDetail.student_id == student.id))).scalars().first()
+        previous_academics = (await db.execute(select(models.PreviousAcademic).filter(models.PreviousAcademic.student_id == student.id))).scalars().all()
+        extra_curricular = (await db.execute(select(models.ExtraCurricular).filter(models.ExtraCurricular.student_id == student.id))).scalars().all()
+        diary_rows = (await db.execute(select(models.CounselorDiary).filter(models.CounselorDiary.student_id == student.id))).scalars().all()
+        
+        internal_marks_count = len([m for m in marks if m.cit1 is not None or m.cit2 is not None or m.cit3 is not None])
+        
+        record_health = cls.build_record_health(
+            contact_info=contact_info,
+            family_details=family_details,
+            previous_academics=previous_academics,
+            extra_curricular=extra_curricular,
+            counselor_diary=diary_rows,
+            semester_grades=marks,
+            internal_marks=[1] * internal_marks_count # Dummy list for length check if needed OR adjust build_record_health
+        )
 
         return schemas.StudentCommandCenterResponse(
             roll_no=student.roll_no,
@@ -653,8 +717,9 @@ class StudentService:
             risk=risk,
             metrics=metrics,
             recommended_actions=recommended_actions,
-            semester_focus=[],
-            recent_results=[],
+            semester_focus=analytics.semester_performance,
+            recent_results=recent_results,
+            record_health=record_health
         )
 
     @staticmethod

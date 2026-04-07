@@ -281,6 +281,7 @@ class StudentPerformance(Student):
     attendance_summary: List[AttendanceResponse] = Field(default_factory=list)
     # Backwards-compatible student dashboard payload (pivoted per subject)
     marks: List[ReportCardMark] = Field(default_factory=list)
+    semester_performance: List[SemesterPerformanceItem] = Field(default_factory=list)
 
 
 class GradeDistributionItem(BaseModel):

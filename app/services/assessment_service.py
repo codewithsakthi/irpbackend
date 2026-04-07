@@ -95,7 +95,7 @@ class AssessmentService:
         to_update = []
         
         for item in update_list:
-            marks = float(item.marks or 0)
+            marks = item.marks  # Preserve None/NULL from schema
             assessment_type = str(item.assessment_type or "").strip().upper()
             attempt = item.attempt or 1
             
@@ -103,7 +103,8 @@ class AssessmentService:
             grade: str | None = None
             result_status: str | None = None
 
-            if assessment_type == "SEMESTER_EXAM":
+            # Only compute grade for semester exam if marks are present
+            if assessment_type == "SEMESTER_EXAM" and marks is not None:
                 ccode = course_codes.get(item.subject_id)
                 internal_m = internals_map.get((item.student_id, item.subject_id))
                 computed = compute_grade(

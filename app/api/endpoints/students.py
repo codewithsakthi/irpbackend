@@ -85,8 +85,10 @@ async def get_student_performance(
     )
     marks = await StudentService.get_report_card_marks(student.id, db)
 
+    analytics = await StudentService.calculate_analytics(student, db)
     payload = schemas.StudentPerformance.model_validate(student, from_attributes=True)
     payload.marks = marks
+    payload.semester_performance = analytics.semester_performance
     return payload
 
 @router.get(
