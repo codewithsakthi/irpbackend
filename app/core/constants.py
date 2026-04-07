@@ -28,6 +28,7 @@ DIRECTORY_SORT_KEYS = {
     'internal': lambda item: item.average_internal_percentage or 0,
     'rank': lambda item: item.rank or 999999,
     'attendance': lambda item: item.attendance_percentage or 0,
+    'backlogs': lambda item: item.backlogs or 0,
 }
 
 CURRICULUM_CREDITS = {

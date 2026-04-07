@@ -449,6 +449,8 @@ class AdminDirectoryStudent(BaseModel):
     average_internal_percentage: Optional[float] = 0.0
     backlogs: int = 0
     rank: Optional[int] = None
+    global_rank: Optional[int] = None
+    semester_gpas: dict[int, float] = {}
     is_initial_password: bool = False
 
 

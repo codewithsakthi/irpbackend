@@ -42,6 +42,7 @@ class AdminService:
                     mp.student_id,
                     st.roll_no,
                     sb.course_code,
+                    sb.semester,
                     CASE 
                         WHEN sb.course_code LIKE '24AC%' THEN 0.0
                         ELSE COALESCE(NULLIF(sb.credits, 0), ccm.credit, 0)
@@ -106,6 +107,42 @@ class AdminService:
                 FROM marks_scored
                 GROUP BY roll_no
             ),
+            semester_agg AS (
+                SELECT 
+                    roll_no,
+                    semester,
+                    ROUND(
+                        (
+                            CASE
+                                WHEN SUM(credit) FILTER (
+                                    WHERE credit > 0
+                                      AND ({grade_point_from_grade_or_marks_sql('sem_grade', 'total_marks').strip()}) IS NOT NULL
+                                ) > 0 THEN
+                                    SUM(
+                                        ({grade_point_from_grade_or_marks_sql('sem_grade', 'total_marks').strip()}) * credit
+                                    ) / SUM(credit) FILTER (
+                                        WHERE credit > 0
+                                          AND ({grade_point_from_grade_or_marks_sql('sem_grade', 'total_marks').strip()}) IS NOT NULL
+                                    )
+                                ELSE AVG(
+                                    ({grade_point_from_grade_or_marks_sql('sem_grade', 'total_marks').strip()})
+                                ) FILTER (
+                                    WHERE ({grade_point_from_grade_or_marks_sql('sem_grade', 'total_marks').strip()}) IS NOT NULL
+                                      AND course_code NOT LIKE '24AC%'
+                                )
+                            END
+                        )::numeric, 2
+                    ) AS sgpa
+                FROM marks_scored
+                GROUP BY roll_no, semester
+            ),
+            semester_json AS (
+                SELECT 
+                    roll_no,
+                    json_object_agg(semester, sgpa) AS semester_gpas
+                FROM semester_agg
+                GROUP BY roll_no
+            ),
             attendance_agg AS (
                 SELECT
                     st.roll_no,
@@ -136,18 +173,19 @@ class AdminService:
                 COALESCE(ga.average_internal_percentage, 0) AS average_internal_percentage,
                 COALESCE(ga.backlogs, 0) AS backlogs,
                 u.is_initial_password,
+                COALESCE(sj.semester_gpas, '{{}}'::json) AS semester_gpas,
                 DENSE_RANK() OVER (
-                    ORDER BY
+                    ORDER BY 
                         COALESCE(ga.average_grade_points_sort, 0) DESC,
                         COALESCE(ga.backlogs, 0) ASC,
-                        COALESCE(aa.attendance_percentage, 0) DESC,
-                        s.roll_no ASC
-                ) AS rank
+                        COALESCE(aa.attendance_percentage, 0) DESC
+                ) AS global_rank
             FROM students s
-            JOIN users u ON u.id = s.id
+            LEFT JOIN users u ON u.id = s.id
             LEFT JOIN contact_info ci ON ci.student_id = s.id
             LEFT JOIN grade_agg ga ON ga.roll_no = s.roll_no
             LEFT JOIN attendance_agg aa ON aa.roll_no = s.roll_no
+            LEFT JOIN semester_json sj ON sj.roll_no = s.roll_no
         """
 
     @classmethod
@@ -155,7 +193,13 @@ class AdminService:
         query = text(f"{cls._admin_directory_query_text(credits_cte_values)} ORDER BY s.roll_no DESC")
         result = await db.execute(query)
         rows = result.mappings().all()
-        return [schemas.AdminDirectoryStudent(**dict(row)) for row in rows]
+        results = []
+        for row in rows:
+            data = dict(row)
+            # Initialize local rank with global rank
+            data['rank'] = data['global_rank']
+            results.append(schemas.AdminDirectoryStudent(**data))
+        return results
 
     @staticmethod
     def filter_admin_directory(
@@ -171,6 +215,97 @@ class AdminService:
         limit: int = 200,
     ):
         results = directory
+        
+        # 1. Apply Academic Cohort Filters (Batch, Semester, Section)
+        # These define the group for relative ranking.
+        if batch:
+            results = [item for item in results if (item.batch or '').lower() == batch.strip().lower()]
+        if semester is not None:
+            results = [item for item in results if item.current_semester == semester]
+        if section:
+            results = [item for item in results if (item.section or '').lower() == section.strip().lower()]
+
+        # 2. Performance Metric Adjustment: If semester is selected, update GPA to SGPA
+        if semester is not None:
+            for item in results:
+                # json_object_agg in PostgreSQL stores integer keys as strings (e.g., "2").
+                # Some asyncpg versions produce "2.0" (float key) or integer keys directly.
+                # Try all plausible key forms.
+                sem_gpas = item.semester_gpas or {}
+                sgpa = (
+                    sem_gpas.get(str(semester))
+                    or sem_gpas.get(str(float(semester)))
+                    or sem_gpas.get(semester)        # int key (asyncpg native)
+                )
+                item.average_grade_points = float(sgpa) if sgpa is not None else 0.0
+
+
+        # 3. Recalculate Cohort-Relative Ranking based on the academic filters.
+        # Always recalculate rank when any filter is active to ensure cohort-relative accuracy.
+        # Uses DENSE_RANK semantics: same score → same rank, next rank skips.
+        # Rounds GPA to 2dp to avoid float precision issues causing spurious rank separations.
+        if any([batch, semester, section]):
+            # When semester is active, backlogs are cumulative so don't use them as a
+            # tiebreaker (they'd mix data from different semesters). Use attendance instead.
+            if semester is not None:
+                ranking_key = lambda x: (
+                    -round(x.average_grade_points or 0, 2),
+                    -round(x.attendance_percentage or 0, 2),
+                    x.roll_no or '',
+                )
+                metrics_key = lambda x: (
+                    round(x.average_grade_points or 0, 2),
+                    round(x.attendance_percentage or 0, 2),
+                )
+            else:
+                ranking_key = lambda x: (
+                    -round(x.average_grade_points or 0, 2),
+                    (x.backlogs or 0),
+                    -round(x.attendance_percentage or 0, 2),
+                    x.roll_no or '',
+                )
+                metrics_key = lambda x: (
+                    round(x.average_grade_points or 0, 2),
+                    x.backlogs or 0,
+                    round(x.attendance_percentage or 0, 2),
+                )
+
+            ranking_sorted = sorted(results, key=ranking_key)
+            current_rank = 0
+            last_metrics = None
+            for item in ranking_sorted:
+                m = metrics_key(item)
+                if m != last_metrics:
+                    current_rank += 1
+                    last_metrics = m
+                item.rank = current_rank
+        else:
+            # No cohort filter → recalculate global rank with DENSE_RANK semantics
+            # (matches the SQL DENSE_RANK in _admin_directory_query_text)
+            ranking_sorted = sorted(
+                results,
+                key=lambda x: (
+                    -round(x.average_grade_points or 0, 2),
+                    x.backlogs or 0,
+                    -round(x.attendance_percentage or 0, 2),
+                    x.roll_no or '',
+                ),
+            )
+            current_rank = 0
+            last_metrics = None
+            for item in ranking_sorted:
+                m = (
+                    round(item.average_grade_points or 0, 2),
+                    item.backlogs or 0,
+                    round(item.attendance_percentage or 0, 2),
+                )
+                if m != last_metrics:
+                    current_rank += 1
+                    last_metrics = m
+                item.rank = current_rank
+
+        # 4. Apply View Filters (Search, City, Risk)
+        # These narrow what the user sees, but don't change the academic ranks within the cohort.
         search_term = search.strip().lower()
         if search_term:
             results = [
@@ -184,12 +319,7 @@ class AdminService:
             ]
         if city:
             results = [item for item in results if (item.city or '').lower() == city.strip().lower()]
-        if batch:
-            results = [item for item in results if (item.batch or '').lower() == batch.strip().lower()]
-        if semester is not None:
-            results = [item for item in results if item.current_semester == semester]
-        if section:
-            results = [item for item in results if (item.section or '').lower() == section.strip().lower()]
+            
         if risk_only:
             results = [
                 item for item in results
@@ -200,10 +330,12 @@ class AdminService:
                 or item.attendance_count == 0
             ]
 
+        # 5. Apply sorting for display
         key_fn = DIRECTORY_SORT_KEYS.get(sort_by, DIRECTORY_SORT_KEYS['roll_no'])
         reverse = sort_dir.lower() != 'asc'
         results = sorted(results, key=key_fn, reverse=reverse)
-        return results[:max(1, min(limit, 500))]
+
+        return results[:limit]
 
     @staticmethod
     def build_directory_insights(directory: list[schemas.AdminDirectoryStudent]) -> schemas.AdminDirectoryInsights:

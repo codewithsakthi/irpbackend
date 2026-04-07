@@ -150,8 +150,8 @@ def grade_point_from_marks_sql(marks_expr: str) -> str:
         WHEN ({marks_expr}) >= 80 THEN 9
         WHEN ({marks_expr}) >= 70 THEN 8
         WHEN ({marks_expr}) >= 60 THEN 7
-        WHEN ({marks_expr}) >= 50 THEN 6
-        WHEN ({marks_expr}) >= 45 THEN 5
+        WHEN ({marks_expr}) >= 55 THEN 6
+        WHEN ({marks_expr}) >= 50 THEN 5
         ELSE 0
     END
     """

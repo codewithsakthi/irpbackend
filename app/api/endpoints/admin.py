@@ -73,6 +73,7 @@ class StudentSortBy(str, Enum):
     GPA = "gpa"
     ATTENDANCE = "attendance"
     RANK = "rank"
+    BACKLOGS = "backlogs"
 
 class SortDir(str, Enum):
     ASC = "asc"

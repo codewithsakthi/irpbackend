@@ -434,8 +434,8 @@ class StudentService:
                 gp = (sub['EXAM'] / 10)
             
             if gp is not None:
-                total_credit_points += credits * gp
-                total_credits += credits
+                total_credit_points += float(credits) * float(gp)
+                total_credits += float(credits)
         
         average_grade_points = round(total_credit_points / total_credits, 2) if total_credits > 0 else 0.0
 
