@@ -1494,13 +1494,17 @@ async def create_timetable(
     """Create a new timetable entry."""
     require_admin(current_user)
     
-    # Check for conflicts (same batch, section, day, period)
+    # Check for conflicts (same batch, section, day, period, semester, year)
+    # The database constraint is: UNIQUE (batch, section, day_of_week, period, semester, academic_year)
+    # UniqueConstraint('batch', 'section', 'day_of_week', 'period', 'semester', 'academic_year', name='uq_timetable_slot')
     existing = await db.execute(
         select(models.TimeTable).filter(
             models.TimeTable.batch == payload.batch,
             models.TimeTable.section == payload.section,
             models.TimeTable.day_of_week == payload.day_of_week,
-            models.TimeTable.period == payload.period
+            models.TimeTable.period == payload.period,
+            models.TimeTable.semester == payload.semester,
+            models.TimeTable.academic_year == payload.academic_year
         )
     )
     if existing.scalars().first():

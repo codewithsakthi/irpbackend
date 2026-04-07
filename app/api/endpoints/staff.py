@@ -1,8 +1,8 @@
-from __future__ import annotations
+from datetime import date, datetime
 from typing import List, Optional
 from fastapi import APIRouter, Depends, HTTPException, Query, Path, Request, Body
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, update, func, case
+from sqlalchemy import select, update, func, case, insert
 from sqlalchemy.orm import joinedload
 import sqlalchemy as sa
 
@@ -90,12 +90,15 @@ async def get_staff_dashboard(
     recent_updates = []
 
     for a, subject, _program in assignments:
-        students_res = await db.execute(
-            select(models.Student)
-            .filter(models.Student.program_id == subject.program_id)
-            .filter(models.Student.current_semester == subject.semester)
-            .filter(models.Student.section == a.section)
+        # Flexible student filtering
+        student_query = select(models.Student).filter(
+            models.Student.program_id == subject.program_id,
+            models.Student.current_semester.in_([subject.semester - 1, subject.semester, subject.semester + 1])
         )
+        if a.section:
+            student_query = student_query.filter(models.Student.section == a.section)
+            
+        students_res = await db.execute(student_query)
         students = students_res.scalars().all()
         count = len(students)
         total_students += count
@@ -112,7 +115,8 @@ async def get_staff_dashboard(
                 academic_year=a.academic_year,
                 student_count=0,
                 average_marks=0.0,
-                pass_percentage=0.0
+                pass_percentage=0.0,
+                average_attendance=0.0
             ))
             continue
 
@@ -123,18 +127,30 @@ async def get_staff_dashboard(
         )
         assessments = assessments_res.scalars().all()
 
-        passed = 0
+        # Track per-student performance for a smarter Pass Rate
+        student_stats = {} # student_id -> {sum, count, has_exam, passed_exam}
         total_m = 0.0
-        count_final = 0
+        count_marks = 0
         
         for m in assessments:
-            if m.assessment_type == 'SEMESTER_EXAM':
-                count_final += 1
-                if (m.marks or 0) >= 50:
-                    passed += 1
-                if m.marks is not None:
-                    total_m += float(m.marks)
-                    total_performance_acc += float(m.marks)
+            if m.marks is not None:
+                marks_val = float(m.marks)
+                total_m += marks_val
+                count_marks += 1
+                
+                sid = m.student_id
+                if sid not in student_stats:
+                    student_stats[sid] = {"sum": 0.0, "count": 0, "has_exam": False, "passed_exam": False}
+                
+                student_stats[sid]["sum"] += marks_val
+                student_stats[sid]["count"] += 1
+                
+                if m.assessment_type.upper() == 'SEMESTER_EXAM':
+                    student_stats[sid]["has_exam"] = True
+                    if marks_val >= 50:
+                        student_stats[sid]["passed_exam"] = True
+                    
+                    total_performance_acc += marks_val
                     performance_count += 1
             
             if m.updated_at:
@@ -148,8 +164,19 @@ async def get_staff_dashboard(
                         updated_at=m.updated_at
                     ))
 
-        pass_percentage = (passed / count_final * 100) if count_final else 0.0
-        average_marks = (total_m / count_final) if count_final else 0.0
+        # Calculate smarter Pass Rate
+        passed_students = 0
+        for sid, stats in student_stats.items():
+            if stats["has_exam"]:
+                if stats["passed_exam"]:
+                    passed_students += 1
+            else:
+                # Fallback: Is the aggregate CIT average >= 50?
+                if stats["count"] > 0 and (stats["sum"] / stats["count"]) >= 50:
+                    passed_students += 1
+        
+        pass_percentage = (passed_students / len(student_stats) * 100) if student_stats else 0.0
+        average_marks = (total_m / count_marks) if count_marks else 0.0
 
         att_res = await db.execute(
             select(models.PeriodAttendance)
@@ -265,6 +292,88 @@ async def get_subject_students(
         ))
     
     return res
+
+
+@router.get(
+    "/subjects/{subject_id}/marks",
+    response_model=List[schemas.StaffStudentMarkRow],
+    summary="Get Students and Marks for Subject",
+    description="Fetch students in the assigned section for a subject along with their aggregated CIT and Semester marks."
+)
+async def get_subject_marks(
+    subject_id: int = Path(...),
+    section: Optional[str] = Query(None),
+    db: AsyncSession = Depends(get_db),
+    current_user: models.User = Depends(auth.get_current_user)
+):
+    verify_staff_access(current_user)
+
+    # Verify assignment
+    assignment_res = await db.execute(
+        select(models.FacultySubjectAssignment)
+        .filter(models.FacultySubjectAssignment.faculty_id == current_user.id)
+        .filter(models.FacultySubjectAssignment.subject_id == subject_id)
+    )
+    assignment = assignment_res.scalars().first()
+    if not assignment:
+        raise HTTPException(status_code=403, detail="Not assigned to this subject")
+
+    # Fetch subject
+    subject_res = await db.execute(select(models.Subject).filter(models.Subject.id == subject_id))
+    subject = subject_res.scalars().first()
+    
+    effective_section = section or assignment.section
+
+    # Fetch students
+    student_query = select(models.Student).filter(
+        models.Student.program_id == subject.program_id,
+        models.Student.current_semester.in_([subject.semester, subject.semester - 1])
+    )
+    if effective_section:
+        student_query = student_query.filter(models.Student.section == effective_section)
+    
+    students = (await db.execute(student_query)).scalars().all()
+    student_ids = [s.id for s in students]
+
+    if not student_ids:
+        return []
+
+    # Fetch assessments
+    assessment_query = select(models.StudentAssessment).filter(
+        models.StudentAssessment.subject_id == subject_id,
+        models.StudentAssessment.student_id.in_(student_ids)
+    )
+    assessments = (await db.execute(assessment_query)).scalars().all()
+
+    # Aggregate marks
+    mark_map = {} # student_id -> {cit1, cit2, cit3, semester_exam}
+    for a in assessments:
+        sid = a.student_id
+        if sid not in mark_map:
+            mark_map[sid] = {"cit1": None, "cit2": None, "cit3": None, "semester_exam": None}
+        
+        atype = a.assessment_type.upper()
+        if atype == "CIT1": mark_map[sid]["cit1"] = float(a.marks) if a.marks is not None else None
+        elif atype == "CIT2": mark_map[sid]["cit2"] = float(a.marks) if a.marks is not None else None
+        elif atype == "CIT3": mark_map[sid]["cit3"] = float(a.marks) if a.marks is not None else None
+        elif atype == "SEMESTER_EXAM": mark_map[sid]["semester_exam"] = float(a.marks) if a.marks is not None else None
+
+    # Final response
+    result = []
+    for s in students:
+        marks = mark_map.get(s.id, {})
+        result.append(schemas.StaffStudentMarkRow(
+            student_id=s.id,
+            roll_no=s.roll_no,
+            name=s.name,
+            cit1=marks.get("cit1"),
+            cit2=marks.get("cit2"),
+            cit3=marks.get("cit3"),
+            semester_exam=marks.get("semester_exam")
+        ))
+    
+    result.sort(key=lambda x: x.roll_no)
+    return result
 
 
 @router.get(
@@ -433,54 +542,71 @@ async def submit_period_attendance(
             fallback_query = fallback_query.filter(models.Student.section == section_filter)
         students_res = await db.execute(fallback_query)
         students = students_res.scalars().all()
-
     if not students:
         raise HTTPException(status_code=400, detail="No students found for this program/semester.")
 
     absentees_set = {roll.strip().upper() for roll in attendance_data.absentees if roll.strip()}
     od_set = {roll.strip().upper() for roll in getattr(attendance_data, 'od_list', []) if roll.strip()}
 
+    # ── Bulk Attendance Operations ──
+    now = datetime.now()
+    
+    # 1. Fetch existing attendance for this specific session
+    existing_stmt = select(models.PeriodAttendance).where(
+        models.PeriodAttendance.subject_id == attendance_data.subject_id,
+        models.PeriodAttendance.date == attendance_data.date,
+        models.PeriodAttendance.period == attendance_data.period,
+        models.PeriodAttendance.student_id.in_([s.id for s in students])
+    )
+    existing_res = await db.execute(existing_stmt)
+    existing_lookup = {r.student_id: r for r in existing_res.scalars().all()}
+
+    to_insert = []
+    to_update = []
+
     for student in students:
         roll = student.roll_no.strip().upper()
-        if roll in absentees_set:
-            status = 'A'
-        elif roll in od_set:
-            status = 'O'
+        status = 'P'
+        if roll in absentees_set: status = 'A'
+        elif roll in od_set: status = 'O'
+        
+        val_dict = {
+            "student_id": student.id,
+            "subject_id": attendance_data.subject_id,
+            "semester": attendance_data.semester,
+            "date": attendance_data.date,
+            "period": attendance_data.period,
+            "status": status,
+            "marked_by_faculty_id": current_user.id,
+            "is_substitute": is_substitute,
+            "updated_at": now,
+        }
+
+        if student.id in existing_lookup:
+            to_update.append(val_dict)
         else:
-            status = 'P'
+            to_insert.append(val_dict)
 
-        # Try to find existing record for upsert
-        existing_res = await db.execute(
-            select(models.PeriodAttendance)
-            .filter(models.PeriodAttendance.student_id == student.id)
-            .filter(models.PeriodAttendance.subject_id == attendance_data.subject_id)
-            .filter(models.PeriodAttendance.date == attendance_data.date)
-            .filter(models.PeriodAttendance.period == attendance_data.period)
-        )
-        existing = existing_res.scalars().first()
-
-        if existing:
-            await db.execute(
+    # 2. Execute Batch Operations
+    if to_insert:
+        await db.execute(insert(models.PeriodAttendance), to_insert)
+        
+    if to_update:
+        for upd in to_update:
+            stmt = (
                 update(models.PeriodAttendance)
-                .where(models.PeriodAttendance.id == existing.id)
+                .where(models.PeriodAttendance.student_id == upd["student_id"])
+                .where(models.PeriodAttendance.subject_id == upd["subject_id"])
+                .where(models.PeriodAttendance.date == upd["date"])
+                .where(models.PeriodAttendance.period == upd["period"])
                 .values(
-                    status=status,
-                    marked_by_faculty_id=current_user.id,
-                    is_substitute=is_substitute,
-                    semester=attendance_data.semester,
+                    status=upd["status"],
+                    marked_by_faculty_id=upd["marked_by_faculty_id"],
+                    is_substitute=upd["is_substitute"],
+                    updated_at=upd["updated_at"]
                 )
             )
-        else:
-            db.add(models.PeriodAttendance(
-                student_id=student.id,
-                subject_id=attendance_data.subject_id,
-                date=attendance_data.date,
-                period=attendance_data.period,
-                status=status,
-                marked_by_faculty_id=current_user.id,
-                is_substitute=is_substitute,
-                semester=attendance_data.semester,
-            ))
+            await db.execute(stmt)
 
     await db.commit()
     sub_note = " (marked as substitute)" if is_substitute else ""

@@ -1234,6 +1234,15 @@ class StaffSubject(BaseModel):
     pass_percentage: Optional[float] = 0.0
     average_attendance: Optional[float] = 0.0
 
+class StaffStudentMarkRow(BaseModel):
+    student_id: int
+    roll_no: str
+    name: str
+    cit1: Optional[float] = None
+    cit2: Optional[float] = None
+    cit3: Optional[float] = None
+    semester_exam: Optional[float] = None
+
 class StaffStudentAssessmentUpdate(BaseModel):
     student_id: int
     subject_id: int
@@ -1241,6 +1250,7 @@ class StaffStudentAssessmentUpdate(BaseModel):
     assessment_type: str
     marks: Optional[float] = None
     remarks: Optional[str] = None
+    attempt: Optional[int] = 1
 
 class RecentMarkUpdate(BaseModel):
     subject_name: str

@@ -122,7 +122,7 @@ class TimeTable(Base):
     updated_at = Column(TIMESTAMP, server_default=text("CURRENT_TIMESTAMP"), onupdate=text("CURRENT_TIMESTAMP"))
 
     __table_args__ = (
-        UniqueConstraint('batch', 'section', 'day_of_week', 'period', 'academic_year', name='uq_timetable_slot'),
+        UniqueConstraint('batch', 'section', 'day_of_week', 'period', 'semester', 'academic_year', name='uq_timetable_slot'),
         CheckConstraint('day_of_week >= 1 AND day_of_week <= 7', name='check_day_of_week'),
         CheckConstraint('period >= 1 AND period <= 8', name='check_period'),
     )
