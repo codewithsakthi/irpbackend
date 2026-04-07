@@ -1244,13 +1244,12 @@ class StaffStudentMarkRow(BaseModel):
     cit1: Optional[float] = None
     cit2: Optional[float] = None
     cit3: Optional[float] = None
-    semester_exam: Optional[float] = None
 
 class StaffStudentAssessmentUpdate(BaseModel):
     student_id: int
     subject_id: int
     semester: int
-    assessment_type: str
+    assessment_type: str = Field(..., pattern='^(CIT1|CIT2|CIT3)$', description="Assessment type: only CIT1, CIT2, CIT3 allowed for staff updates")
     marks: Optional[float] = None
     remarks: Optional[str] = None
     attempt: Optional[int] = 1

@@ -99,21 +99,18 @@ class AssessmentService:
             assessment_type = str(item.assessment_type or "").strip().upper()
             attempt = item.attempt or 1
             
+            # Prevent staff from editing semester exam marks
+            if assessment_type == "SEMESTER_EXAM":
+                raise HTTPException(status_code=403, detail="Staff cannot edit semester exam marks")
+            
+            # Only allow CIT assessments for staff
+            if assessment_type not in ["CIT1", "CIT2", "CIT3"]:
+                raise HTTPException(status_code=400, detail=f"Invalid assessment type for staff: {assessment_type}")
+            
             # Calculate metrics
             grade: str | None = None
             result_status: str | None = None
-
-            # Only compute grade for semester exam if marks are present
-            if assessment_type == "SEMESTER_EXAM" and marks is not None:
-                ccode = course_codes.get(item.subject_id)
-                internal_m = internals_map.get((item.student_id, item.subject_id))
-                computed = compute_grade(
-                    course_code=str(ccode) if ccode is not None else None,
-                    cit1=internal_m,
-                    semester_exam=marks,
-                )
-                grade = computed.grade
-                result_status = computed.result_status
+            # Note: Grade calculation only relevant for SEMESTER_EXAM, which staff cannot edit
 
             key = (item.student_id, item.subject_id, item.semester, assessment_type, attempt)
             

@@ -124,6 +124,7 @@ async def get_staff_dashboard(
             select(models.StudentAssessment)
             .filter(models.StudentAssessment.subject_id == a.subject_id)
             .filter(models.StudentAssessment.student_id.in_(student_ids))
+            .filter(models.StudentAssessment.is_final == True)  # Only use finalized assessments
         )
         assessments = assessments_res.scalars().all()
 
@@ -341,22 +342,23 @@ async def get_subject_marks(
     # Fetch assessments
     assessment_query = select(models.StudentAssessment).filter(
         models.StudentAssessment.subject_id == subject_id,
-        models.StudentAssessment.student_id.in_(student_ids)
+        models.StudentAssessment.student_id.in_(student_ids),
+        models.StudentAssessment.is_final == True  # Only use finalized assessments
     )
     assessments = (await db.execute(assessment_query)).scalars().all()
 
     # Aggregate marks
-    mark_map = {} # student_id -> {cit1, cit2, cit3, semester_exam}
+    mark_map = {} # student_id -> {cit1, cit2, cit3}
     for a in assessments:
         sid = a.student_id
         if sid not in mark_map:
-            mark_map[sid] = {"cit1": None, "cit2": None, "cit3": None, "semester_exam": None}
+            mark_map[sid] = {"cit1": None, "cit2": None, "cit3": None}
         
         atype = a.assessment_type.upper()
         if atype == "CIT1": mark_map[sid]["cit1"] = float(a.marks) if a.marks is not None else None
         elif atype == "CIT2": mark_map[sid]["cit2"] = float(a.marks) if a.marks is not None else None
         elif atype == "CIT3": mark_map[sid]["cit3"] = float(a.marks) if a.marks is not None else None
-        elif atype == "SEMESTER_EXAM": mark_map[sid]["semester_exam"] = float(a.marks) if a.marks is not None else None
+        # Removed SEMESTER_EXAM handling as staff cannot edit semester marks
 
     # Final response
     result = []
@@ -368,8 +370,7 @@ async def get_subject_marks(
             name=s.name,
             cit1=marks.get("cit1"),
             cit2=marks.get("cit2"),
-            cit3=marks.get("cit3"),
-            semester_exam=marks.get("semester_exam")
+            cit3=marks.get("cit3")
         ))
     
     result.sort(key=lambda x: x.roll_no)

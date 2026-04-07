@@ -1302,7 +1302,8 @@ async def _get_placement_summary(db: AsyncSession, curriculum_credits: dict[str,
         )
         SELECT
             SUM(CASE WHEN sc.cgpa_proxy >= 7 AND sc.active_arrears = 0 AND COALESCE(cs.coding_subject_score, 0) >= 65 THEN 1 ELSE 0 END) AS ready_count,
-            SUM(CASE WHEN sc.cgpa_proxy >= 6 AND sc.active_arrears <= 1 AND COALESCE(cs.coding_subject_score, 0) >= 55 THEN 1 ELSE 0 END) AS almost_ready_count,
+            SUM(CASE WHEN sc.cgpa_proxy >= 6 AND sc.active_arrears <= 1 AND COALESCE(cs.coding_subject_score, 0) >= 55 
+                     AND NOT (sc.active_arrears > 1 OR sc.cgpa_proxy < 6) THEN 1 ELSE 0 END) AS almost_ready_count,
             SUM(CASE WHEN sc.active_arrears > 1 OR sc.cgpa_proxy < 6 THEN 1 ELSE 0 END) AS blocked_count,
             ROUND(AVG(COALESCE(cs.coding_subject_score, 0))::numeric, 2) AS avg_coding_score
         FROM student_current sc
