@@ -113,10 +113,30 @@ async def build_hod_dashboard(
                 COALESCE(mp.sem_exam, mp.lab_marks, mp.project_marks) AS exam_marks,
                 ({total_marks_calculation_sql(sg_internal_case)}) AS total_marks,
                 ({grade_point_calculation_sql(sg_internal_case)}) AS grade_point,
-                ({failed_calculation_sql(sg_internal_case)}) AS failed
+                ({failed_calculation_sql(sg_internal_case)}) AS failed,
+                -- Percentile rank per subject
+                PERCENT_RANK() OVER (PARTITION BY mp.subject_id ORDER BY ({total_marks_calculation_sql(sg_internal_case)}) ASC) * 100 AS percentile,
+                -- Subject average for normalization
+                AVG(({total_marks_calculation_sql(sg_internal_case)})) OVER (PARTITION BY mp.subject_id) AS subject_avg,
+                -- Normalized score
+                CASE WHEN AVG(({total_marks_calculation_sql(sg_internal_case)})) OVER (PARTITION BY mp.subject_id) > 0
+                     THEN ({total_marks_calculation_sql(sg_internal_case)}) / AVG(({total_marks_calculation_sql(sg_internal_case)})) OVER (PARTITION BY mp.subject_id)
+                     ELSE NULL END AS normalized_score
             FROM marks_pivot mp
             JOIN students st ON st.id = mp.student_id
             JOIN subject_catalog sc ON sc.id = mp.subject_id
+        ),
+        -- Hybrid performance label per subject
+        marks_hybrid AS (
+            SELECT *,
+                CASE
+                    WHEN percentile < 30 OR total_marks < 50 THEN 'At Risk'
+                    WHEN percentile >= 30 AND percentile < 60 THEN 'Average'
+                    WHEN percentile >= 60 AND percentile < 85 THEN 'Good'
+                    WHEN percentile >= 85 THEN 'Excellent'
+                    ELSE 'Unknown'
+                END AS performance_label
+            FROM marks_enriched
         ),
         semester_gpa AS (
             SELECT
@@ -131,7 +151,7 @@ async def build_hod_dashboard(
                 END AS sgpa,
                 ROUND(AVG(effective_internal_marks)::numeric, 2) AS avg_internal,
                 ROUND((100.0 * SUM(CASE WHEN failed = 0 THEN 1 ELSE 0 END) / NULLIF(COUNT(*), 0))::numeric, 2) AS pass_rate
-            FROM marks_enriched
+            FROM marks_hybrid
             WHERE total_marks IS NOT NULL
             GROUP BY student_id, roll_no, name, semester
         ),
@@ -223,7 +243,7 @@ async def build_hod_dashboard(
                 COUNT(*) AS attempts,
                 SUM(me.failed) AS red_zone_count,
                 ROUND((100.0 * SUM(me.failed) / NULLIF(COUNT(*), 0))::numeric, 2) AS fail_rate
-            FROM marks_enriched me
+            FROM marks_hybrid me
             GROUP BY me.subject_code, me.subject_name, me.semester
             HAVING COUNT(*) >= 3
         ),

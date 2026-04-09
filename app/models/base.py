@@ -81,9 +81,19 @@ class Subject(Base):
     semester = Column(Integer)
     is_active = Column(Boolean, default=True, nullable=False)
     updated_at = Column(TIMESTAMP, server_default=text("CURRENT_TIMESTAMP"), onupdate=text("CURRENT_TIMESTAMP"))
-
+    
+    # Threshold configuration for hybrid performance evaluation
+    pass_threshold = Column(Numeric(5, 2), default=50.0, nullable=False, comment="Minimum marks to pass (default: 50)")
+    target_average = Column(Numeric(5, 2), default=75.0, nullable=True, comment="Target average for good performance")
+    percentile_excellent = Column(Numeric(5, 2), default=85.0, nullable=False, comment="Minimum percentile for 'Excellent' (default: 85)")
+    percentile_good = Column(Numeric(5, 2), default=60.0, nullable=False, comment="Minimum percentile for 'Good' (default: 60)")
+    percentile_average = Column(Numeric(5, 2), default=30.0, nullable=False, comment="Minimum percentile for 'Average' (default: 30)")
+    
     __table_args__ = (
         UniqueConstraint('course_code', 'program_id', 'semester', name='uq_subject_identity'),
+        CheckConstraint("pass_threshold >= 0 AND pass_threshold <= 100", name='chk_pass_threshold_range'),
+        CheckConstraint("target_average IS NULL OR (target_average >= 0 AND target_average <= 100)", name='chk_target_average_range'),
+        CheckConstraint("percentile_excellent >= percentile_good AND percentile_good >= percentile_average AND percentile_average >= 0 AND percentile_excellent <= 100", name='chk_percentile_hierarchy'),
     )
 
     faculty_assignments = relationship("FacultySubjectAssignment", back_populates="subject")

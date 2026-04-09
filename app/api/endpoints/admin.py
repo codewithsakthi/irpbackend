@@ -3,6 +3,7 @@ from typing import Optional, List
 from fastapi import APIRouter, Depends, Query, Path, HTTPException, Response, Request
 from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
+from pydantic import Field
 
 from ...core import auth
 from ...core.database import get_db, settings
@@ -13,7 +14,7 @@ from ...schemas import base as schemas
 from ...services.admin_service import AdminService
 from ...core.limiter import limiter
 from ...services import enterprise_analytics
-from sqlalchemy import select, update, delete, func, case as sql_case, and_
+from sqlalchemy import select, update, delete, func, text, case as sql_case, and_
 
 router = APIRouter(tags=["Admin"])
 
@@ -259,6 +260,250 @@ async def get_subject_catalog(
 ):
     require_admin(current_user)
     return await enterprise_analytics.get_subject_catalog(db)
+
+
+async def check_threshold_schema_compatibility(db: AsyncSession):
+    """Check if threshold management schema is available"""
+    try:
+        # Try a simple query on threshold columns
+        await db.execute(text("SELECT pass_threshold FROM subjects LIMIT 1"))
+        return True
+    except Exception:
+        raise HTTPException(
+            status_code=503, 
+            detail="Threshold management requires database migration. Please run 'alembic upgrade head' first."
+        )
+
+
+@router.put(
+    "/subjects/{subject_id}/thresholds",
+    response_model=schemas.SubjectThresholdResponse,
+    summary="Update Subject Performance Thresholds",
+    description="Update performance evaluation thresholds for a specific subject in the hybrid evaluation system."
+)
+async def update_subject_thresholds(
+    subject_id: int = Path(description="Subject ID to update"),
+    thresholds: schemas.SubjectThresholdUpdate = ...,
+    current_user: models.User = Depends(auth.get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    require_admin(current_user)
+    
+    # Check if threshold schema is available
+    await check_threshold_schema_compatibility(db)
+    
+    # Validate subject exists
+    subject_result = await db.execute(
+        select(models.Subject).where(models.Subject.id == subject_id)
+    )
+    subject = subject_result.scalar_one_or_none()
+    
+    if not subject:
+        raise HTTPException(status_code=404, detail="Subject not found")
+    
+    # Update thresholds
+    await db.execute(
+        update(models.Subject)
+        .where(models.Subject.id == subject_id)
+        .values(
+            pass_threshold=thresholds.pass_threshold,
+            target_average=thresholds.target_average,
+            percentile_excellent=thresholds.percentile_excellent,
+            percentile_good=thresholds.percentile_good,
+            percentile_average=thresholds.percentile_average
+        )
+    )
+    
+    await db.commit()
+    await db.refresh(subject)
+    
+    return schemas.SubjectThresholdResponse(
+        subject_id=subject.id,
+        subject_code=subject.course_code,
+        subject_name=subject.name,
+        updated_thresholds=thresholds
+    )
+
+
+@router.patch(
+    "/subjects/{subject_id}/thresholds",
+    response_model=schemas.SubjectThresholdResponse,
+    summary="Partial Update Subject Performance Thresholds",
+    description="Partially update performance evaluation thresholds for a specific subject."
+)
+async def patch_subject_thresholds(
+    subject_id: int = Path(description="Subject ID to update"),
+    threshold_patch: schemas.SubjectThresholdPatch = ...,
+    current_user: models.User = Depends(auth.get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    require_admin(current_user)
+    
+    # Check if threshold schema is available
+    await check_threshold_schema_compatibility(db)
+    
+    # Validate subject exists
+    subject_result = await db.execute(
+        select(models.Subject).where(models.Subject.id == subject_id)
+    )
+    subject = subject_result.scalar_one_or_none()
+    
+    if not subject:
+        raise HTTPException(status_code=404, detail="Subject not found")
+
+    # Update thresholds with provided fields
+    patch_data = threshold_patch.model_dump(exclude_unset=True)
+    if patch_data:
+        await db.execute(
+            update(models.Subject)
+            .where(models.Subject.id == subject_id)
+            .values(**patch_data)
+        )
+        await db.commit()
+        await db.refresh(subject)
+    
+    return schemas.SubjectThresholdResponse(
+        subject_id=subject.id,
+        subject_code=subject.course_code,
+        subject_name=subject.name,
+        updated_thresholds=schemas.SubjectThresholdUpdate(
+            pass_threshold=subject.pass_threshold,
+            target_average=subject.target_average,
+            percentile_excellent=subject.percentile_excellent,
+            percentile_good=subject.percentile_good,
+            percentile_average=subject.percentile_average
+        )
+    )
+
+
+@router.put(
+    "/subjects/thresholds/batch",
+    response_model=List[schemas.SubjectThresholdResponse],
+    summary="Batch Update Subject Thresholds",
+    description="Update performance thresholds for multiple subjects simultaneously."
+)
+async def batch_update_subject_thresholds(
+    batch_update: schemas.SubjectThresholdBatchUpdate = ...,
+    current_user: models.User = Depends(auth.get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    require_admin(current_user)
+    
+    # Check if threshold schema is available
+    await check_threshold_schema_compatibility(db)
+    
+    if not batch_update.subject_ids:
+        raise HTTPException(status_code=400, detail="At least one subject ID is required")
+    
+    # Validate all subjects exist
+    subjects_result = await db.execute(
+        select(models.Subject).where(models.Subject.id.in_(batch_update.subject_ids))
+    )
+    subjects = subjects_result.scalars().all()
+    
+    if len(subjects) != len(batch_update.subject_ids):
+        found_ids = {s.id for s in subjects}
+        missing_ids = [sid for sid in batch_update.subject_ids if sid not in found_ids]
+        raise HTTPException(
+            status_code=404, 
+            detail=f"Subjects not found: {missing_ids}"
+        )
+    
+    # Batch update thresholds
+    await db.execute(
+        update(models.Subject)
+        .where(models.Subject.id.in_(batch_update.subject_ids))
+        .values(
+            pass_threshold=batch_update.thresholds.pass_threshold,
+            target_average=batch_update.thresholds.target_average,
+            percentile_excellent=batch_update.thresholds.percentile_excellent,
+            percentile_good=batch_update.thresholds.percentile_good,
+            percentile_average=batch_update.thresholds.percentile_average
+        )
+    )
+    
+    await db.commit()
+    
+    # Return updated subjects
+    responses = []
+    for subject in subjects:
+        responses.append(schemas.SubjectThresholdResponse(
+            subject_id=subject.id,
+            subject_code=subject.course_code,
+            subject_name=subject.name,
+            updated_thresholds=batch_update.thresholds
+        ))
+    
+    return responses
+
+
+@router.get(
+    "/subjects/{subject_id}/thresholds",
+    response_model=schemas.SubjectThresholdUpdate,
+    summary="Get Subject Performance Thresholds",
+    description="Retrieve current performance evaluation thresholds for a specific subject."
+)
+async def get_subject_thresholds(
+    subject_id: int = Path(description="Subject ID to query"),
+    current_user: models.User = Depends(auth.get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    require_admin(current_user)
+    
+    subject_result = await db.execute(
+        select(models.Subject).where(models.Subject.id == subject_id)
+    )
+    subject = subject_result.scalar_one_or_none()
+    
+    if not subject:
+        raise HTTPException(status_code=404, detail="Subject not found")
+    
+    return schemas.SubjectThresholdUpdate(
+        pass_threshold=float(subject.pass_threshold),
+        target_average=float(subject.target_average) if subject.target_average else None,
+        percentile_excellent=float(subject.percentile_excellent),
+        percentile_good=float(subject.percentile_good),
+        percentile_average=float(subject.percentile_average)
+    )
+
+
+@router.post(
+    "/subjects/thresholds/reset",
+    response_model=schemas.MessageResponse,
+    summary="Reset Subject Thresholds to Defaults",
+    description="Reset performance thresholds for specified subjects to system defaults."
+)
+async def reset_subject_thresholds(
+    request: schemas.SubjectThresholdReset,
+    current_user: models.User = Depends(auth.get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    require_admin(current_user)
+    
+    # Check if threshold schema is available
+    await check_threshold_schema_compatibility(db)
+    
+    if not request.subject_ids:
+        raise HTTPException(status_code=400, detail="At least one subject ID is required")
+    
+    # Reset to default values
+    await db.execute(
+        update(models.Subject)
+        .where(models.Subject.id.in_(request.subject_ids))
+        .values(
+            pass_threshold=50.0,
+            target_average=75.0,
+            percentile_excellent=85.0,
+            percentile_good=60.0,
+            percentile_average=30.0
+        )
+    )
+    
+    await db.commit()
+    
+    return schemas.MessageResponse(
+        message=f"Thresholds reset to defaults for {len(request.subject_ids)} subjects"
+    )
 
 # Original /subject-bottlenecks endpoint removed as per instruction to replace with /bottlenecks
 # @router.get("/subject-bottlenecks", response_model=schemas.SubjectBottleneckResponse)

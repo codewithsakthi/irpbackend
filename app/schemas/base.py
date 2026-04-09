@@ -3,7 +3,7 @@ import datetime as dt
 from datetime import date, datetime
 from typing import List, Optional
 
-from pydantic import BaseModel, ConfigDict, EmailStr, Field
+from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator
 
 
 class RoleBase(BaseModel):
@@ -153,6 +153,13 @@ class Subject(BaseModel):
     credits: float = 0.0
     semester: Optional[int] = None
     is_active: bool = True
+    
+    # Threshold configuration for hybrid performance evaluation
+    pass_threshold: float = 50.0
+    target_average: Optional[float] = 75.0
+    percentile_excellent: float = 85.0
+    percentile_good: float = 60.0
+    percentile_average: float = 30.0
 
     class Config:
         from_attributes = True
@@ -274,6 +281,9 @@ class ReportCardMark(BaseModel):
     result_status: Optional[str] = None
     attempt: Optional[int] = None
     remarks: Optional[str] = None
+    percentile: Optional[float] = None
+    normalized_score: Optional[float] = None
+    performance_label: Optional[str] = None
 
 class StudentPerformance(Student):
     program: Optional[Program] = None
@@ -866,6 +876,71 @@ class SubjectCatalogItem(BaseModel):
     semester: Optional[int] = None
     records: int = Field(ge=0)
     is_active: bool = True
+    
+    # Include threshold info in catalog for admin management
+    pass_threshold: float = 50.0
+    target_average: Optional[float] = 75.0
+    percentile_excellent: float = 85.0
+    percentile_good: float = 60.0
+    percentile_average: float = 30.0
+
+
+class SubjectThresholdUpdate(BaseModel):
+    """Schema for updating subject performance thresholds"""
+    model_config = ConfigDict(extra='forbid')
+    
+    pass_threshold: float = Field(ge=0, le=100, description="Minimum marks to pass (0-100)")
+    target_average: Optional[float] = Field(None, ge=0, le=100, description="Target average for good performance (0-100)")
+    percentile_excellent: float = Field(ge=0, le=100, description="Minimum percentile for 'Excellent' classification")
+    percentile_good: float = Field(ge=0, le=100, description="Minimum percentile for 'Good' classification")  
+    percentile_average: float = Field(ge=0, le=100, description="Minimum percentile for 'Average' classification")
+    
+    @field_validator('percentile_excellent', 'percentile_good', 'percentile_average')
+    @classmethod
+    def validate_percentile_hierarchy(cls, v, info):
+        """Ensure percentile thresholds are in proper hierarchy"""
+        if info.field_name == 'percentile_excellent' and 'percentile_good' in info.data and v < info.data['percentile_good']:
+            raise ValueError('Excellent threshold must be >= Good threshold')
+        if info.field_name == 'percentile_good' and 'percentile_average' in info.data and v < info.data['percentile_average']:
+            raise ValueError('Good threshold must be >= Average threshold')
+        return v
+
+
+class SubjectThresholdPatch(BaseModel):
+    """Schema for partial updates to subject performance thresholds"""
+    model_config = ConfigDict(extra='forbid')
+    
+    pass_threshold: Optional[float] = Field(None, ge=0, le=100)
+    target_average: Optional[float] = Field(None, ge=0, le=100)
+    percentile_excellent: Optional[float] = Field(None, ge=0, le=100)
+    percentile_good: Optional[float] = Field(None, ge=0, le=100)
+    percentile_average: Optional[float] = Field(None, ge=0, le=100)
+
+
+class SubjectThresholdBatchUpdate(BaseModel):
+    """Schema for batch updating thresholds across multiple subjects"""
+    model_config = ConfigDict(extra='forbid')
+    
+    subject_ids: List[int] = Field(description="List of subject IDs to update")
+    thresholds: SubjectThresholdUpdate = Field(description="Threshold values to apply")
+    
+    
+class SubjectThresholdResponse(BaseModel):
+    """Response after threshold update"""
+    model_config = ConfigDict(extra='forbid')
+    
+    subject_id: int
+    subject_code: str
+    subject_name: str
+    updated_thresholds: SubjectThresholdUpdate
+    message: str = "Thresholds updated successfully"
+
+
+class SubjectThresholdReset(BaseModel):
+    """Schema for resetting subject thresholds to defaults"""
+    model_config = ConfigDict(extra='forbid')
+    
+    subject_ids: List[int] = Field(description="List of subject IDs to reset to defaults")
 
 
 class SubjectToggleResponse(BaseModel):

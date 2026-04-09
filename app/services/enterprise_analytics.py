@@ -634,23 +634,64 @@ async def get_overall_leaderboard(
 
 
 async def get_subject_catalog(db: AsyncSession) -> list[schemas.SubjectCatalogItem]:
-    query = text(
-        """
-        SELECT
-            s.id,
-            s.course_code AS subject_code,
-            s.name AS subject_name,
-            s.semester,
-            s.is_active,
-            COUNT(sa.id) AS records
-        FROM subjects s
-        LEFT JOIN student_assessments sa ON sa.subject_id = s.id AND sa.assessment_type = 'SEMESTER_EXAM'
-        GROUP BY s.id, s.course_code, s.name, s.semester, s.is_active
-        ORDER BY COUNT(sa.id) DESC, s.course_code
-        """
-    )
-    rows = (await db.execute(query)).mappings().all()
-    return [schemas.SubjectCatalogItem(**dict(row)) for row in rows]
+    """Get subject catalog with threshold data, backwards compatible with pre-migration schema"""
+    
+    # Check if threshold columns exist in the database
+    try:
+        # Try the full query with threshold columns first
+        query_with_thresholds = text(
+            """
+            SELECT
+                s.id,
+                s.course_code AS subject_code,
+                s.name AS subject_name,
+                s.semester,
+                s.is_active,
+                COUNT(sa.id) AS records,
+                COALESCE(s.pass_threshold, 50.0) AS pass_threshold,
+                s.target_average,
+                COALESCE(s.percentile_excellent, 85.0) AS percentile_excellent,
+                COALESCE(s.percentile_good, 60.0) AS percentile_good,
+                COALESCE(s.percentile_average, 30.0) AS percentile_average
+            FROM subjects s
+            LEFT JOIN student_assessments sa ON sa.subject_id = s.id AND sa.assessment_type = 'SEMESTER_EXAM'
+            GROUP BY s.id, s.course_code, s.name, s.semester, s.is_active, 
+                     s.pass_threshold, s.target_average, s.percentile_excellent, 
+                     s.percentile_good, s.percentile_average
+            ORDER BY COUNT(sa.id) DESC, s.course_code
+            """
+        )
+        rows = (await db.execute(query_with_thresholds)).mappings().all()
+        return [schemas.SubjectCatalogItem(**dict(row)) for row in rows]
+    
+    except Exception as e:
+        # Log the migration status
+        print(f"INFO: Threshold columns not found in database. Using default values. Error: {str(e)}")
+        print("INFO: Run 'alembic upgrade head' to apply threshold management schema updates.")
+        
+        # Fallback to basic query without threshold columns (for pre-migration compatibility)
+        query_basic = text(
+            """
+            SELECT
+                s.id,
+                s.course_code AS subject_code,
+                s.name AS subject_name,
+                s.semester,
+                s.is_active,
+                COUNT(sa.id) AS records,
+                50.0 AS pass_threshold,
+                75.0 AS target_average,
+                85.0 AS percentile_excellent,
+                60.0 AS percentile_good,
+                30.0 AS percentile_average
+            FROM subjects s
+            LEFT JOIN student_assessments sa ON sa.subject_id = s.id AND sa.assessment_type = 'SEMESTER_EXAM'
+            GROUP BY s.id, s.course_code, s.name, s.semester, s.is_active
+            ORDER BY COUNT(sa.id) DESC, s.course_code
+            """
+        )
+        rows = (await db.execute(query_basic)).mappings().all()
+        return [schemas.SubjectCatalogItem(**dict(row)) for row in rows]
 
 
 async def get_student_360(
@@ -1389,6 +1430,21 @@ async def get_command_center(
     from .analytics_service import build_hod_dashboard
 
     dashboard = await build_hod_dashboard(db, curriculum_credits)
+    # Patch: propagate new analytics fields to top-level response for admin dashboard
+    # If dashboard.directory or dashboard.risk_students contain per-subject marks, map new fields
+    # (Assume downstream consumers expect these fields in marks or subject performance lists)
+    for student in getattr(dashboard, 'directory', []):
+        if hasattr(student, 'marks'):
+            for mark in student.marks:
+                mark.percentile = getattr(mark, 'percentile', None)
+                mark.normalized_score = getattr(mark, 'normalized_score', None)
+                mark.performance_label = getattr(mark, 'performance_label', None)
+    for student in getattr(dashboard, 'risk_students', []):
+        if hasattr(student, 'marks'):
+            for mark in student.marks:
+                mark.percentile = getattr(mark, 'percentile', None)
+                mark.normalized_score = getattr(mark, 'normalized_score', None)
+                mark.performance_label = getattr(mark, 'performance_label', None)
     directory = await _get_admin_directory_rollup(db, curriculum_credits)
     subject_catalog = await get_subject_catalog(db)
     bottlenecks = await get_subject_bottlenecks(db, curriculum_credits, subject_code=None, limit=6, offset=0, sort_by="failure_rate")
