@@ -14,7 +14,8 @@ from .core.database import settings
 import sentry_sdk
 from sentry_sdk.integrations.fastapi import FastApiIntegration
 from sqlalchemy import text
-
+from dotenv import load_dotenv
+load_dotenv()
 # Setup logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)

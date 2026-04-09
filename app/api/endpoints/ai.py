@@ -22,11 +22,40 @@ from ...core import auth
 from ...core.database import get_db
 from ...models import base as models
 from ...services import ai_service, enterprise_analytics
+from ...services.gemini_service import gemini_generate_content
+from fastapi import Body
+
 from ...core.constants import CURRICULUM_CREDITS
 
-logger = logging.getLogger(__name__)
 
+
+logger = logging.getLogger(__name__)
 router = APIRouter(tags=["AI"], responses={401: {"description": "Unauthorized"}})
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Gemini LLM Endpoint
+# ──────────────────────────────────────────────────────────────────────────────
+
+class GeminiAskRequest(BaseModel):
+    prompt: str
+
+@router.post("/gemini/ask")
+async def gemini_ask(
+    body: GeminiAskRequest = Body(...),
+    current_user: models.User = Depends(auth.get_current_user),
+):
+    """
+    Get a response from Gemini LLM for a given prompt.
+    """
+    if not body.prompt.strip():
+        raise HTTPException(status_code=400, detail="Prompt must not be empty.")
+    try:
+        result = await gemini_generate_content(body.prompt)
+        return {"response": result}
+    except Exception as e:
+        logger.error(f"Gemini API error: {e}")
+        raise HTTPException(status_code=500, detail="Gemini API call failed.")
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -37,6 +66,33 @@ class CopilotAskRequest(BaseModel):
     question: str
     dashboard_context: Optional[str] = None  # pre-built context string from frontend
     chat_history: Optional[list[dict]] = None  # [{role, content}] for multi-turn
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Gemini LLM Endpoint
+# ──────────────────────────────────────────────────────────────────────────────
+
+from fastapi import Body
+
+class GeminiAskRequest(BaseModel):
+    prompt: str
+
+@router.post("/gemini/ask")
+async def gemini_ask(
+    body: GeminiAskRequest = Body(...),
+    current_user: models.User = Depends(auth.get_current_user),
+):
+    """
+    Get a response from Gemini LLM for a given prompt.
+    """
+    if not body.prompt.strip():
+        raise HTTPException(status_code=400, detail="Prompt must not be empty.")
+    try:
+        result = await gemini_generate_content(body.prompt)
+        return {"response": result}
+    except Exception as e:
+        logger.error(f"Gemini API error: {e}")
+        raise HTTPException(status_code=500, detail="Gemini API call failed.")
 
 
 class StudentSummaryRequest(BaseModel):
