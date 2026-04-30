@@ -16,7 +16,7 @@ class Settings(BaseSettings):
     DATABASE_URL: Optional[str] = Field(default=None, env="DATABASE_URL")
     SECRET_KEY: str = "maybedemo"
     ALGORITHM: str = "HS256"
-    ACCESS_TOKEN_EXPIRE_MINUTES: int = 30
+    ACCESS_TOKEN_EXPIRE_MINUTES: int = 120  # 2 hours
     REFRESH_TOKEN_EXPIRE_DAYS: int = 30  # Max JWT lifetime; inactivity logout (7 days) is enforced client-side
     DB_POOL_SIZE: int = 3
     DB_MAX_OVERFLOW: int = 7
