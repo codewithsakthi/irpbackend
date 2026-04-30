@@ -1208,7 +1208,7 @@ async def spotlight_search(db: AsyncSession, *, query: str, limit: int = 8) -> s
         SELECT * FROM (
             SELECT 'student' AS entity_type, st.roll_no AS entity_id, st.name AS label, concat(coalesce(st.batch, 'No batch'), ' | Sem ', coalesce(st.current_semester, 0)) AS sublabel
             FROM students st
-            WHERE st.name ILIKE :pattern OR st.roll_no ILIKE :pattern
+            WHERE st.name ILIKE :pattern OR st.roll_no ILIKE :pattern OR st.reg_no ILIKE :pattern
             UNION ALL
             SELECT 'faculty' AS entity_type, CAST(sf.id AS TEXT) AS entity_id, sf.name AS label, sf.department AS sublabel
             FROM staff sf

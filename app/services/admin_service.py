@@ -312,6 +312,7 @@ class AdminService:
                 item for item in results
                 if search_term in ' '.join([
                     item.roll_no or '',
+                    item.reg_no or '',
                     item.name or '',
                     item.email or '',
                     item.city or '',

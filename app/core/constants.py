@@ -20,6 +20,7 @@ GRADE_POINTS = {
 
 DIRECTORY_SORT_KEYS = {
     'roll_no': lambda item: item.roll_no or '',
+    'reg_no': lambda item: item.reg_no or '',
     'name': lambda item: (item.name or '').lower(),
     'city': lambda item: (item.city or '').lower(),
     'batch': lambda item: (item.batch or '').lower(),

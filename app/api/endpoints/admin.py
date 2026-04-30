@@ -70,6 +70,7 @@ class RiskSortBy(str, Enum):
 
 class StudentSortBy(str, Enum):
     ROLL_NO = "roll_no"
+    REG_NO = "reg_no"
     NAME = "name"
     GPA = "gpa"
     ATTENDANCE = "attendance"
