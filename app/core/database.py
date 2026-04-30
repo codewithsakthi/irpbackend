@@ -17,7 +17,7 @@ class Settings(BaseSettings):
     SECRET_KEY: str = "maybedemo"
     ALGORITHM: str = "HS256"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 30
-    REFRESH_TOKEN_EXPIRE_DAYS: int = 7
+    REFRESH_TOKEN_EXPIRE_DAYS: int = 30  # Max JWT lifetime; inactivity logout (7 days) is enforced client-side
     DB_POOL_SIZE: int = 3
     DB_MAX_OVERFLOW: int = 7
     # CORS_ORIGINS: comma-separated list of allowed frontend origins
