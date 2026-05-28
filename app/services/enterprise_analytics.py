@@ -1140,6 +1140,7 @@ async def get_student_360(
 
     # Build and return response
     response = schemas.Student360Profile(
+        student_id=student_id,
         roll_no=profile["roll_no"],
         reg_no=profile.get("reg_no"),
         student_name=profile["student_name"],

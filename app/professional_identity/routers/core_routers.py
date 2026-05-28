@@ -1,9 +1,16 @@
 """SPICS — Profile, Project, Certification, Skill, and Career Readiness routers"""
+import json
+import logging
+import os
 from typing import Optional
-from fastapi import APIRouter, BackgroundTasks, Depends, File, HTTPException, Query, UploadFile
-from fastapi.responses import FileResponse
+import httpx
+from pydantic import BaseModel
+from fastapi import APIRouter, BackgroundTasks, Depends, File, HTTPException, Query, UploadFile, Response, Body
+from fastapi.responses import FileResponse, RedirectResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 from ...core.database import get_db
 from ...core import auth
@@ -24,7 +31,7 @@ from ..services.services import (
 from ..validators.validators import validate_upload_file
 from ..services.resume_service import extract_resume_text, save_resume_file
 from ..repositories.profile_repo import ProfileRepository
-from ..utils.utils import UPLOAD_BASE
+from ..utils.utils import UPLOAD_BASE, get_picture_upload_dir
 
 # ── Profile Router ─────────────────────────────────────────────────────────────
 
@@ -65,15 +72,138 @@ async def upsert_profile(
 
 @profile_router.post("/connect-linkedin", response_model=MessageResponse)
 async def connect_linkedin(
+    username: str = Body(..., embed=True),
     current_user: core_models.User = Depends(auth.get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
+    """Store LinkedIn profile URL from username."""
     _check_root_flag()
     student_id = _get_student_id(current_user)
-    # For safety, do not create or show demo / mock LinkedIn details.
-    # This endpoint is intentionally disabled to avoid inserting fake/demo data into real student profiles.
-    from fastapi import HTTPException
-    raise HTTPException(status_code=400, detail="Demo LinkedIn import is disabled. Please connect a real LinkedIn account using the OAuth flow.")
+
+    # Normalize to URL
+    username = username.strip().replace("https://www.linkedin.com/in/", "").replace("linkedin.com/in/", "").strip("/")
+    linkedin_url = f"https://www.linkedin.com/in/{username}/"
+
+    from ..repositories.profile_repo import ProfileRepository
+    profile_repo = ProfileRepository(db)
+    profile = await profile_repo.get_by_student_id(student_id)
+    if not profile:
+        profile = await profile_repo.create(student_id, {})
+
+    await profile_repo.update(profile, {
+        "linkedin_url": linkedin_url,
+    })
+
+    return MessageResponse(
+        message=f"LinkedIn profile linked: {linkedin_url}",
+        detail=linkedin_url,
+    )
+
+
+@profile_router.post("/upload-picture", response_model=MessageResponse)
+async def upload_profile_picture(
+    file: UploadFile = File(...),
+    current_user: core_models.User = Depends(auth.get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Upload professional profile picture."""
+    _check_root_flag()
+    student_id = _get_student_id(current_user)
+
+    content = await file.read()
+    if len(content) > 5 * 1024 * 1024:
+        raise HTTPException(status_code=400, detail="Image size exceeds 5MB limit.")
+
+    ext = Path(file.filename).suffix.lower() if file.filename else ".png"
+    if ext not in {".png", ".jpg", ".jpeg", ".gif", ".webp"}:
+        raise HTTPException(
+            status_code=400,
+            detail="Unsupported image format. Allowed formats: PNG, JPEG, GIF, WEBP."
+        )
+
+    # 1. Get and clean directory
+    upload_dir = get_picture_upload_dir(student_id)
+    for existing_file in upload_dir.glob("custom.*"):
+        try:
+            existing_file.unlink()
+        except Exception:
+            pass
+
+    # 2. Save new image
+    filename = f"custom{ext}"
+    dest_path = upload_dir / filename
+    dest_path.write_bytes(content)
+
+    # 3. Update database
+    profile_repo = ProfileRepository(db)
+    profile = await profile_repo.get_by_student_id(student_id)
+    if not profile:
+        profile = await profile_repo.create(student_id, {})
+
+    # Save relative path so the server can serve it locally
+    picture_rel_path = f"custom{ext}"
+    await profile_repo.update(profile, {
+        "picture_url": picture_rel_path
+    })
+
+    return MessageResponse(
+        message="Profile picture uploaded successfully.",
+        detail=picture_rel_path,
+    )
+
+
+@profile_router.get("/{student_id}/picture")
+async def get_profile_picture(
+    student_id: int,
+    db: AsyncSession = Depends(get_db),
+):
+    """Serve or redirect profile picture for a student."""
+    _check_root_flag()
+    profile = await ProfileRepository(db).get_by_student_id(student_id)
+    if not profile:
+        raise HTTPException(status_code=404, detail="No profile picture found.")
+
+    picture_url = profile.picture_url
+
+    # Fallback to GitHub avatar if no picture is set but GitHub is available
+    if not picture_url and profile.github_username:
+        picture_url = f"https://github.com/{profile.github_username}.png"
+
+    if not picture_url:
+        raise HTTPException(status_code=404, detail="No profile picture found.")
+
+    # If it is a remote URL (e.g. GitHub/LinkedIn), redirect directly
+    if picture_url.startswith(("http://", "https://")):
+        return RedirectResponse(url=picture_url)
+
+    # Otherwise, resolve local file path
+    upload_dir = get_picture_upload_dir(student_id)
+    full_path = (upload_dir / picture_url).resolve()
+
+    uploads_root = UPLOAD_BASE if UPLOAD_BASE.is_absolute() else (Path.cwd() / UPLOAD_BASE)
+    uploads_root = uploads_root.resolve()
+
+    # Prevent path traversal and verify existence
+    if uploads_root not in full_path.parents and full_path != uploads_root:
+        raise HTTPException(status_code=400, detail="Invalid picture file path.")
+
+    if not full_path.exists() or not full_path.is_file():
+        raise HTTPException(status_code=404, detail="Profile picture file not found.")
+
+    suffix = full_path.suffix.lower()
+    media_type = "image/png"
+    if suffix in {".jpg", ".jpeg"}:
+        media_type = "image/jpeg"
+    elif suffix == ".gif":
+        media_type = "image/gif"
+    elif suffix == ".webp":
+        media_type = "image/webp"
+
+    return FileResponse(
+        path=str(full_path),
+        media_type=media_type,
+    )
+
 
 
 

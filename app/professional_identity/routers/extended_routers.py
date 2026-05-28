@@ -139,6 +139,7 @@ async def github_oauth_callback(
     await profile_repo.update(profile, {
         "github_username": github_username,
         "github_access_token": access_token,
+        "picture_url": f"https://github.com/{github_username}.png",
     })
 
     # 4. Fetch repositories and import them automatically as projects

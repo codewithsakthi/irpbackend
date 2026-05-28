@@ -56,6 +56,7 @@ class ProfileService:
         score = compute_completion_score(profile, len(projects), len(skills), len(certs))
         profile.profile_completion_score = score
         await db.commit()
+        await db.refresh(profile)
 
 
 class ProjectService:

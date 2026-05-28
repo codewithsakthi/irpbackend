@@ -26,6 +26,7 @@ class ProfileCreateRequest(BaseModel):
     github_username:      Optional[str] = Field(None, max_length=100)
     portfolio_url:        Optional[str] = Field(None, max_length=500)
     linkedin_url:         Optional[str] = Field(None, max_length=500)
+    picture_url:          Optional[str] = Field(None)
     leetcode_username:    Optional[str] = Field(None, max_length=100)
     hackerrank_username:  Optional[str] = Field(None, max_length=100)
     codechef_username:    Optional[str] = Field(None, max_length=100)
@@ -51,6 +52,7 @@ class ProfileResponse(SPICSBase):
     github_username:         Optional[str]
     portfolio_url:           Optional[str]
     linkedin_url:            Optional[str]
+    picture_url:             Optional[str]
     leetcode_username:       Optional[str]
     hackerrank_username:     Optional[str]
     codechef_username:       Optional[str]
@@ -61,6 +63,7 @@ class ProfileResponse(SPICSBase):
     resume_uploaded_at:      Optional[datetime]
     leetcode_cache_data:     Optional[Any] = None
     leetcode_cache_expires_at: Optional[datetime] = None
+    linkedin_cache_data:     Optional[Any] = None
     profile_completion_score: Optional[float]
     is_public:               bool
     created_at:              Optional[datetime]

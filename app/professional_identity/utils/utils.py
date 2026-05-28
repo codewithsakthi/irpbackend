@@ -69,6 +69,12 @@ def get_cert_upload_dir(student_id: int) -> Path:
     return path
 
 
+def get_picture_upload_dir(student_id: int) -> Path:
+    path = UPLOAD_BASE / "pictures" / str(student_id)
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
 def save_upload(file_content: bytes, dest_path: Path) -> None:
     dest_path.write_bytes(file_content)
 

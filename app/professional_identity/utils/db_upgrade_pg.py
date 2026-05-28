@@ -53,6 +53,24 @@ async def upgrade_db():
             )
         else:
             logger.info("leetcode_cache_expires_at already exists")
+
+        # Dynamic picture_url column check and upgrade
+        result_pic = await conn.execute(text("""
+            SELECT column_name 
+            FROM information_schema.columns 
+            WHERE table_name='student_professional_profiles' 
+              AND column_name = 'picture_url';
+        """))
+        if not result_pic.fetchone():
+            logger.info("Adding column picture_url to student_professional_profiles")
+            await conn.execute(
+                text(
+                    "ALTER TABLE student_professional_profiles "
+                    "ADD COLUMN IF NOT EXISTS picture_url VARCHAR(1000);"
+                )
+            )
+        else:
+            logger.info("picture_url already exists")
             
         # Ensure is_github_imported column exists in student_projects
         result = await conn.execute(text("""

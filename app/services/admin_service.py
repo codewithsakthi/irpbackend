@@ -156,6 +156,7 @@ class AdminService:
                 GROUP BY st.roll_no
             )
             SELECT
+                s.id AS id,
                 s.roll_no,
                 s.reg_no,
                 s.name,
@@ -645,6 +646,7 @@ class AdminService:
             ),
             ranked_cohort AS (
                 SELECT
+                    s.id AS id,
                     s.roll_no,
                     s.reg_no,
                     s.name,

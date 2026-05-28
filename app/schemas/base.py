@@ -444,6 +444,7 @@ class AdminOverview(BaseModel):
 
 
 class AdminDirectoryStudent(BaseModel):
+    id: Optional[int] = None
     roll_no: str
     reg_no: Optional[str] = None
     name: str
@@ -1022,6 +1023,7 @@ class StudentRiskDriver(BaseModel):
 class Student360Profile(BaseModel):
     model_config = ConfigDict(extra='forbid')
 
+    student_id: Optional[int] = None
     roll_no: str
     reg_no: Optional[str] = None
     student_name: str
