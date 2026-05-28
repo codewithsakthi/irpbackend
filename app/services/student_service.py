@@ -13,7 +13,10 @@ class StudentService:
     @staticmethod
     async def get_student_record(user: models.User, db: AsyncSession):
         result = await db.execute(
-            select(models.Student).options(joinedload(models.Student.program)).filter(models.Student.id == user.id)
+            select(models.Student)
+            .options(joinedload(models.Student.program))
+            .filter(models.Student.id == user.id)
+            .filter(models.Student.is_deleted == False)
         )
         return result.scalars().first()
 
@@ -21,26 +24,26 @@ class StudentService:
     async def get_student_profile_joined(student_id: int, db: AsyncSession):
         """
         Normalized Student Profile fetch:
-        students + contact_info + family_details + programs + users
+        students + programs + users + family_details (ContactInfo is merged)
         """
         res = await db.execute(
             select(
                 models.Student,
                 models.User,
                 models.Program,
-                models.ContactInfo,
                 models.FamilyDetail,
             )
             .join(models.User, models.User.id == models.Student.id)
             .outerjoin(models.Program, models.Program.id == models.Student.program_id)
-            .outerjoin(models.ContactInfo, models.ContactInfo.student_id == models.Student.id)
             .outerjoin(models.FamilyDetail, models.FamilyDetail.student_id == models.Student.id)
             .filter(models.Student.id == student_id)
+            .filter(models.Student.is_deleted == False)
         )
         row = res.first()
         if not row:
             return None
-        return row  # (Student, User, Program|None, ContactInfo|None, FamilyDetail|None)
+        student, user, program, family = row
+        return (student, user, program, student, family)  # Return student in place of contact info, and family for family info to maintain backward compatibility
 
     @staticmethod
     async def get_accessible_student(roll_no: str, current_user_id: int, role_name: str, db: AsyncSession):
@@ -51,6 +54,7 @@ class StudentService:
                 joinedload(models.Student.assessments).joinedload(models.StudentAssessment.subject),
                 joinedload(models.Student.user),
             )
+            .filter(models.Student.is_deleted == False)
         )
 
         if role_name == 'student':
@@ -404,8 +408,37 @@ class StudentService:
 
     @classmethod
     async def build_full_student_record(cls, roll_no: str, *, student_id: int, db: AsyncSession) -> schemas.FullStudentRecord:
-        contact_info = (await db.execute(select(models.ContactInfo).filter(models.ContactInfo.student_id == student_id))).scalars().first()
-        family_details = (await db.execute(select(models.FamilyDetail).filter(models.FamilyDetail.student_id == student_id))).scalars().first()
+        student = (await db.execute(select(models.Student).filter(models.Student.id == student_id).filter(models.Student.is_deleted == False))).scalars().first()
+        if not student:
+            raise HTTPException(status_code=404, detail="Student not found or is deleted")
+
+        contact_info = schemas.ContactInfoRecord(
+            address=student.address,
+            pincode=student.pincode,
+            phone_primary=student.phone_primary,
+            phone_secondary=student.phone_secondary,
+            phone_tertiary=student.phone_tertiary,
+            email=student.email,
+            city=student.city
+        )
+
+        family_db = (await db.execute(select(models.FamilyDetail).filter(models.FamilyDetail.student_id == student_id))).scalars().first()
+        family_details = None
+        if family_db:
+            family_details = schemas.FamilyDetailsRecord(
+                father_name=family_db.father_name,
+                mother_name=family_db.mother_name,
+                parent_occupation=family_db.occupation,
+                parent_phone=family_db.parent_phone,
+                parent_email=family_db.parent_email,
+                parent_address=family_db.parent_address,
+                emergency_contact_name=family_db.emergency_contact_name,
+                emergency_contact_phone=family_db.emergency_contact_phone,
+                emergency_contact_relation=family_db.emergency_contact_relation,
+                emergency_contact_address=family_db.emergency_contact_address,
+                emergency_contact_email=family_db.emergency_contact_email
+            )
+
         previous_academics = (
             (await db.execute(select(models.PreviousAcademic).filter(models.PreviousAcademic.student_id == student_id).order_by(models.PreviousAcademic.id.asc())))
             .scalars()
@@ -853,7 +886,15 @@ class StudentService:
             )
 
         # Record Health
-        contact_info = (await db.execute(select(models.ContactInfo).filter(models.ContactInfo.student_id == student.id))).scalars().first()
+        contact_info = schemas.ContactInfoRecord(
+            address=student.address,
+            pincode=student.pincode,
+            phone_primary=student.phone_primary,
+            phone_secondary=student.phone_secondary,
+            phone_tertiary=student.phone_tertiary,
+            email=student.email,
+            city=student.city
+        )
         family_details = (await db.execute(select(models.FamilyDetail).filter(models.FamilyDetail.student_id == student.id))).scalars().first()
         previous_academics = (await db.execute(select(models.PreviousAcademic).filter(models.PreviousAcademic.student_id == student.id))).scalars().all()
         extra_curricular = (await db.execute(select(models.ExtraCurricular).filter(models.ExtraCurricular.student_id == student.id))).scalars().all()
@@ -887,9 +928,23 @@ class StudentService:
 
     @staticmethod
     def build_record_health(contact_info, family_details, previous_academics, extra_curricular, counselor_diary, semester_grades, internal_marks):
+        has_contact = False
+        if contact_info:
+            if isinstance(contact_info, schemas.ContactInfoRecord):
+                has_contact = any(getattr(contact_info, f) is not None for f in ['address', 'phone_primary', 'email', 'city'])
+            else:
+                has_contact = True
+                
+        has_family = False
+        if family_details:
+            if isinstance(family_details, schemas.FamilyDetailsRecord):
+                has_family = any(getattr(family_details, f) is not None for f in ['father_name', 'mother_name', 'parent_phone'])
+            else:
+                has_family = True
+
         sections = {
-            'contact': bool(contact_info),
-            'family': bool(family_details),
+            'contact': has_contact,
+            'family': has_family,
             'previous_academics': bool(previous_academics),
             'activities': bool(extra_curricular),
             'counselor_notes': bool(counselor_diary),

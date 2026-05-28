@@ -86,6 +86,19 @@ app.include_router(staff.router, prefix="/api/v1/staff")
 app.include_router(ai.router, prefix="/api/v1/ai")
 app.include_router(websocket.router, prefix="/api/v1")
 
+# ── SPICS: Student Professional Identity & Capability System (isolated module) ──
+try:
+    from .professional_identity.feature_flags import FLAGS as _SPICS_FLAGS
+    if _SPICS_FLAGS.get("ENABLE_PROFESSIONAL_IDENTITY", True):
+        from .professional_identity.routers.main_router import router as _spics_router
+        app.include_router(_spics_router, prefix="/api/v1/professional")
+        logger.info("SPICS: Professional Identity module loaded.")
+    else:
+        logger.info("SPICS: Professional Identity module disabled by feature flag.")
+except Exception as _spics_err:
+    logger.warning(f"SPICS: Module failed to load (non-fatal): {_spics_err}")
+
+
 
 # ---------------------------------------------------------------------------
 # Global Exception Handlers (Ensures CORS headers on errors)
@@ -166,6 +179,15 @@ async def startup():
         async with engine.begin() as conn:
             pass
         logger.info("Database connection verified successfully.")
+
+        # Best-effort compatibility patch for SPICS optional columns that may
+        # be missing on older local databases.
+        try:
+            from .professional_identity.utils.db_upgrade_pg import upgrade_db as _spics_upgrade_db
+
+            await _spics_upgrade_db()
+        except Exception as spics_err:
+            logger.warning(f"SPICS schema compatibility check failed (non-fatal): {spics_err}")
     except Exception as e:
         logger.warning(f"Startup DB ping failed (non-fatal, will retry on first request): {e}")
 

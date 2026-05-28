@@ -159,9 +159,9 @@ class AdminService:
                 s.roll_no,
                 s.reg_no,
                 s.name,
-                ci.city,
-                COALESCE(ci.email, s.email) AS email,
-                ci.phone_primary,
+                s.city,
+                s.email AS email,
+                s.phone_primary,
                 s.batch,
                 s.current_semester,
                 s.section,
@@ -182,7 +182,6 @@ class AdminService:
                 ) AS global_rank
             FROM students s
             LEFT JOIN users u ON u.id = s.id
-            LEFT JOIN contact_info ci ON ci.student_id = s.id
             LEFT JOIN grade_agg ga ON ga.roll_no = s.roll_no
             LEFT JOIN attendance_agg aa ON aa.roll_no = s.roll_no
             LEFT JOIN semester_json sj ON sj.roll_no = s.roll_no
@@ -405,6 +404,324 @@ class AdminService:
             attendance_bands=[schemas.AdminDirectoryInsightItem(label=label, count=count) for label, count in attendance_bands.items()],
             gpa_bands=[schemas.AdminDirectoryInsightItem(label=label, count=count) for label, count in gpa_bands.items()],
         )
+
+    @classmethod
+    async def build_admin_directory_paginated(
+        cls,
+        db: AsyncSession,
+        credits_cte_values: str,
+        search: str = '',
+        city: str = '',
+        batch: str = '',
+        semester: Optional[int] = None,
+        section: str = '',
+        risk_only: bool = False,
+        sort_by: str = 'roll_no',
+        sort_dir: str = 'desc',
+        limit: int = 20,
+        offset: int = 0
+    ):
+        # 1. Cohort filters (applied inside base students CTE)
+        cohort_filters = []
+        params = {}
+        
+        if batch:
+            cohort_filters.append("s.batch = :batch")
+            params["batch"] = batch.strip()
+        if semester is not None:
+            cohort_filters.append("s.current_semester = :semester")
+            params["semester"] = semester
+        if section:
+            cohort_filters.append("s.section = :section")
+            params["section"] = section.strip()
+            
+        cohort_filter_sql = ""
+        if cohort_filters:
+            cohort_filter_sql = " AND " + " AND ".join(cohort_filters)
+            
+        # 2. GPA Metric and Tiebreaker Column (SGPA vs CGPA)
+        if semester is not None:
+            semester_str = str(semester)
+            gpa_column = f"COALESCE((sj.semester_gpas->>'{semester_str}')::numeric, 0.0)"
+            rank_backlogs_tiebreaker = ""
+        else:
+            gpa_column = "ga.average_grade_points_sort"
+            rank_backlogs_tiebreaker = "COALESCE(ga.backlogs, 0) ASC,"
+            
+        # 3. View filters (search, city, risk_only)
+        view_filters = []
+        if search:
+            search_term = f"%{search.strip().lower()}%"
+            view_filters.append("""
+                (LOWER(s.roll_no) LIKE :search
+                 OR LOWER(COALESCE(s.reg_no, '')) LIKE :search
+                 OR LOWER(s.name) LIKE :search
+                 OR LOWER(COALESCE(s.email, '')) LIKE :search
+                 OR LOWER(COALESCE(s.city, '')) LIKE :search)
+            """)
+            params["search"] = search_term
+            
+        if city:
+            view_filters.append("LOWER(s.city) = :city")
+            params["city"] = city.strip().lower()
+            
+        if risk_only:
+            view_filters.append(f"""
+                (COALESCE(s.backlogs, 0) > 0
+                 OR COALESCE(s.average_grade_points, 0) < 6
+                 OR COALESCE(s.average_internal_percentage, 0) < 60
+                 OR COALESCE(s.attendance_percentage, 0) < 75
+                 OR COALESCE(s.attendance_count, 0) = 0)
+            """)
+            
+        view_filter_sql = ""
+        if view_filters:
+            view_filter_sql = " WHERE " + " AND ".join(view_filters)
+            
+        # 4. Sorting
+        sort_column_map = {
+            'roll_no': 's.roll_no',
+            'reg_no': 's.reg_no',
+            'name': 's.name',
+            'gpa': 's.average_grade_points',
+            'internal': 's.average_internal_percentage',
+            'rank': 's.rank',
+            'attendance': 's.attendance_percentage',
+            'backlogs': 's.backlogs',
+        }
+        sort_col = sort_column_map.get(sort_by, 's.roll_no')
+        sort_dir_str = "ASC" if sort_dir.lower() == "asc" else "DESC"
+        
+        # We need limit and offset parameters
+        params["limit"] = limit
+        params["offset"] = offset
+
+        # Query construction
+        query_str = f"""
+            WITH curriculum_credits_map AS (
+                SELECT * FROM (VALUES {credits_cte_values}) AS t(course_code, credit)
+            ),
+            filtered_students AS (
+                SELECT s.* 
+                FROM students s
+                WHERE 1=1
+                {cohort_filter_sql}
+            ),
+            marks_pivot AS (
+                SELECT
+                    v.student_id,
+                    v.subject_id,
+                    v.semester,
+                    MAX(v.marks) FILTER (WHERE v.assessment_type = 'CIT1') AS cit1,
+                    MAX(v.marks) FILTER (WHERE v.assessment_type = 'CIT2') AS cit2,
+                    MAX(v.marks) FILTER (WHERE v.assessment_type = 'CIT3') AS cit3,
+                    MAX(v.marks) FILTER (WHERE v.assessment_type = 'SEMESTER_EXAM') AS sem_exam,
+                    MAX(v.marks) FILTER (WHERE v.assessment_type = 'LAB') AS lab,
+                    MAX(v.marks) FILTER (WHERE v.assessment_type = 'PROJECT') AS project,
+                    MAX(v.result_status) FILTER (WHERE v.assessment_type = 'SEMESTER_EXAM') AS sem_result_status,
+                    MAX(v.grade) FILTER (WHERE v.assessment_type = 'SEMESTER_EXAM') AS sem_grade
+                FROM student_assessments v
+                JOIN filtered_students fs ON fs.id = v.student_id
+                WHERE v.is_final = true
+                GROUP BY v.student_id, v.subject_id, v.semester
+            ),
+            marks_scored AS (
+                SELECT
+                    mp.student_id,
+                    st.roll_no,
+                    sb.course_code,
+                    sb.semester,
+                    CASE 
+                        WHEN sb.course_code LIKE '24AC%' THEN 0.0
+                        ELSE COALESCE(NULLIF(sb.credits, 0), ccm.credit, 0)
+                    END AS credit,
+                    ({best_2_of_3_cits_null_check_sql()}) AS internal_max,
+                    COALESCE(mp.sem_exam, mp.lab, mp.project) AS exam_component,
+                    mp.sem_result_status,
+                    mp.sem_grade,
+                    CASE
+                        WHEN sb.course_code LIKE '24AC%' AND mp.cit1 IS NULL AND mp.cit2 IS NULL AND mp.cit3 IS NULL AND mp.sem_exam IS NULL AND mp.lab IS NULL AND mp.project IS NULL
+                        THEN NULL
+                        WHEN ({best_2_of_3_cits_null_check_sql()}) IS NULL
+                             AND COALESCE(mp.sem_exam, mp.lab, mp.project) IS NULL
+                        THEN NULL
+                        ELSE ({best_2_of_3_cits_with_fallback_sql()})
+                             + COALESCE(COALESCE(mp.sem_exam, mp.lab, mp.project), 0)
+                    END AS total_marks
+                FROM marks_pivot mp
+                JOIN filtered_students st ON st.id = mp.student_id
+                JOIN subjects sb ON sb.id = mp.subject_id
+                LEFT JOIN curriculum_credits_map ccm ON ccm.course_code = sb.course_code
+            ),
+            grade_agg AS (
+                SELECT
+                    roll_no,
+                    COUNT(*) FILTER (
+                        WHERE total_marks IS NOT NULL
+                           OR NULLIF(trim(coalesce(sem_grade, '')), '') IS NOT NULL
+                    ) AS marks_count,
+                    ROUND(AVG(internal_max) FILTER (WHERE internal_max IS NOT NULL)::numeric, 2) AS average_internal_percentage,
+                    SUM(
+                        CASE
+                            WHEN course_code NOT LIKE '24AC%'
+                                AND (
+                                    upper(coalesce(sem_result_status, '')) IN ('FAIL', 'F', 'ABSENT', 'AB')
+                                    OR upper(coalesce(sem_grade, '')) IN ('U', 'F', 'FAIL', 'RA', 'AB', 'ABSENT', 'WH')
+                                )
+                            THEN 1
+                            ELSE 0
+                        END
+                    ) AS backlogs,
+                    (
+                        CASE
+                            WHEN SUM(credit) FILTER (
+                                WHERE credit > 0
+                                  AND ({grade_point_from_grade_or_marks_sql('sem_grade', 'total_marks').strip()}) IS NOT NULL
+                            ) > 0 THEN
+                                SUM(
+                                    ({grade_point_from_grade_or_marks_sql('sem_grade', 'total_marks').strip()}) * credit
+                                ) / SUM(credit) FILTER (
+                                    WHERE credit > 0
+                                      AND ({grade_point_from_grade_or_marks_sql('sem_grade', 'total_marks').strip()}) IS NOT NULL
+                                )
+                            ELSE AVG(
+                                ({grade_point_from_grade_or_marks_sql('sem_grade', 'total_marks').strip()})
+                            ) FILTER (
+                                WHERE ({grade_point_from_grade_or_marks_sql('sem_grade', 'total_marks').strip()}) IS NOT NULL
+                                  AND course_code NOT LIKE '24AC%'
+                            )
+                        END
+                    ) AS average_grade_points_sort
+                FROM marks_scored
+                GROUP BY roll_no
+            ),
+            semester_agg AS (
+                SELECT 
+                    roll_no,
+                    semester,
+                    ROUND(
+                        (
+                            CASE
+                                WHEN SUM(credit) FILTER (
+                                    WHERE credit > 0
+                                      AND ({grade_point_from_grade_or_marks_sql('sem_grade', 'total_marks').strip()}) IS NOT NULL
+                                ) > 0 THEN
+                                    SUM(
+                                        ({grade_point_from_grade_or_marks_sql('sem_grade', 'total_marks').strip()}) * credit
+                                    ) / SUM(credit) FILTER (
+                                        WHERE credit > 0
+                                          AND ({grade_point_from_grade_or_marks_sql('sem_grade', 'total_marks').strip()}) IS NOT NULL
+                                    )
+                                ELSE AVG(
+                                    ({grade_point_from_grade_or_marks_sql('sem_grade', 'total_marks').strip()})
+                                ) FILTER (
+                                    WHERE ({grade_point_from_grade_or_marks_sql('sem_grade', 'total_marks').strip()}) IS NOT NULL
+                                      AND course_code NOT LIKE '24AC%'
+                                )
+                            END
+                        )::numeric, 2
+                    ) AS sgpa
+                FROM marks_scored
+                GROUP BY roll_no, semester
+            ),
+            semester_json AS (
+                SELECT 
+                    roll_no,
+                    json_object_agg(semester, sgpa) AS semester_gpas
+                FROM semester_agg
+                GROUP BY roll_no
+            ),
+            attendance_agg AS (
+                SELECT
+                    st.roll_no,
+                    SUM(v.total_periods) AS attendance_count,
+                    ROUND(
+                        (100.0 * SUM(v.present + v.on_duty) / NULLIF(SUM(v.total_periods), 0))::numeric,
+                        2
+                    ) AS attendance_percentage
+                FROM v_attendance_summary v
+                JOIN filtered_students st ON st.id = v.student_id
+                GROUP BY st.roll_no
+            ),
+            ranked_cohort AS (
+                SELECT
+                    s.roll_no,
+                    s.reg_no,
+                    s.name,
+                    s.city,
+                    s.email AS email,
+                    s.phone_primary,
+                    s.batch,
+                    s.current_semester,
+                    s.section,
+                    COALESCE(ga.marks_count, 0) AS marks_count,
+                    COALESCE(aa.attendance_count, 0) AS attendance_count,
+                    COALESCE(aa.attendance_percentage, 0) AS attendance_percentage,
+                    ROUND(COALESCE({gpa_column}, 0)::numeric, 2) AS average_grade_points,
+                    COALESCE(ga.average_internal_percentage, 0) AS average_internal_percentage,
+                    COALESCE(ga.backlogs, 0) AS backlogs,
+                    u.is_initial_password,
+                    COALESCE(sj.semester_gpas, '{{}}'::json) AS semester_gpas,
+                    DENSE_RANK() OVER (
+                        ORDER BY 
+                            COALESCE({gpa_column}, 0) DESC,
+                            {rank_backlogs_tiebreaker}
+                            COALESCE(aa.attendance_percentage, 0) DESC
+                    ) AS rank,
+                    DENSE_RANK() OVER (
+                        ORDER BY 
+                            COALESCE(ga.average_grade_points_sort, 0) DESC,
+                            COALESCE(ga.backlogs, 0) ASC,
+                            COALESCE(aa.attendance_percentage, 0) DESC
+                    ) AS global_rank
+                FROM filtered_students s
+                LEFT JOIN users u ON u.id = s.id
+                LEFT JOIN grade_agg ga ON ga.roll_no = s.roll_no
+                LEFT JOIN attendance_agg aa ON aa.roll_no = s.roll_no
+                LEFT JOIN semester_json sj ON sj.roll_no = s.roll_no
+            ),
+            view_filtered AS (
+                SELECT s.*, COUNT(*) OVER() AS total_count
+                FROM ranked_cohort s
+                {view_filter_sql}
+            )
+            SELECT * FROM view_filtered s
+            ORDER BY {sort_col} {sort_dir_str}
+            LIMIT :limit OFFSET :offset
+        """
+        
+        query = text(query_str)
+        result = await db.execute(query, params)
+        rows = result.mappings().all()
+        
+        total = 0
+        items = []
+        for row in rows:
+            data = dict(row)
+            total = data.pop('total_count', 0)
+            
+            # Map semester_gpas to dict of {int: float} as pydantic expects
+            sem_gpas_raw = data.get('semester_gpas') or {}
+            if isinstance(sem_gpas_raw, str):
+                import json
+                try:
+                    sem_gpas_raw = json.loads(sem_gpas_raw)
+                except Exception:
+                    sem_gpas_raw = {}
+                    
+            sem_gpas = {}
+            for k, v in sem_gpas_raw.items():
+                if v is not None:
+                    try:
+                        sem_gpas[int(float(k))] = float(v)
+                    except ValueError:
+                        pass
+            data['semester_gpas'] = sem_gpas
+            
+            items.append(schemas.AdminDirectoryStudent(**data))
+            
+        return items, total
+
     @classmethod
     async def assign_sections(cls, db: AsyncSession, batch: str):
         """

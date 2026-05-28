@@ -2,7 +2,7 @@ from datetime import timedelta
 from fastapi import APIRouter, Depends, HTTPException, status, Body, Request
 from fastapi.security import OAuth2PasswordRequestForm
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
+from sqlalchemy import select, func
 from sqlalchemy.orm import joinedload
 
 from ...core import auth
@@ -36,11 +36,12 @@ async def login_for_access_token(
     """
     Authenticate user and return access/refresh tokens.
     """
-    # Fetch user with role
+    # Fetch user with role (case-insensitive username match)
+    normalized_username = (form_data.username or "").strip()
     result = await db.execute(
         select(models.User)
         .options(joinedload(models.User.role))
-        .filter(models.User.username == form_data.username)
+        .filter(func.lower(models.User.username) == func.lower(normalized_username))
     )
     user = result.scalars().first()
 

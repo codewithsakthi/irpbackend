@@ -120,6 +120,19 @@ def _placement_signal(overall_gpa: float, active_arrears: int, attendance_percen
     return "Intervention Required"
 
 
+def _readiness_band(readiness: dict) -> str:
+    completion = float(readiness.get("profile_completion_score") or 0)
+    ai_score = readiness.get("ai_career_readiness_score")
+    combined = completion * 0.4 + (float(ai_score or completion) * 0.6)
+    if combined >= 80:
+        return "Ready"
+    elif combined >= 60:
+        return "Near Ready"
+    elif combined >= 40:
+        return "Building"
+    return "Early Stage"
+
+
 def _tone_from_metric(value: float, warning_cutoff: float, critical_cutoff: float, *, reverse: bool = False) -> str:
     if reverse:
         if value <= critical_cutoff:
@@ -199,7 +212,7 @@ def _base_ctes(curriculum_credits: dict[str, float]) -> str:
     final_assessments AS (
         SELECT *
         FROM student_assessments sa
-        WHERE sa.is_final = true
+        WHERE sa.is_final = true OR sa.assessment_type <> 'SEMESTER_EXAM'
     ),
     marks_pivot AS (
         SELECT
@@ -230,24 +243,22 @@ def _base_ctes(curriculum_credits: dict[str, float]) -> str:
             st.name AS student_name,
             st.batch,
             st.current_semester,
-            COALESCE(ci.email, st.email) AS email,
-            ci.city,
+            st.email,
+            st.city,
             mp.semester,
             sc.course_code AS subject_code,
             sc.name AS subject_name,
             sc.skill_domain,
             sc.has_internal_component,
             sc.credit,
-            ({internal_expr}) AS internal_raw,
-            CASE
-                WHEN sc.has_internal_component THEN ({internal_expr})
-                ELSE NULL
-            END AS internal_marks,
-            CASE
-                WHEN sc.has_internal_component THEN ({internal_expr})
-                ELSE NULL
-            END AS effective_internal_marks,
+            mp.cit1,
+            mp.cit2,
+            mp.cit3,
+            mp.sem_exam,
+            mp.lab_marks,
+            mp.project_marks,
             COALESCE(mp.sem_exam, mp.lab_marks, mp.project_marks) AS exam_marks,
+            ({internal_expr}) AS effective_internal_marks,
             ({total_marks_expr}) AS total_marks,
             CASE
                 WHEN NULLIF(trim(coalesce(mp.sem_grade, '')), '') IS NOT NULL THEN mp.sem_grade
@@ -265,7 +276,6 @@ def _base_ctes(curriculum_credits: dict[str, float]) -> str:
         FROM marks_pivot mp
         JOIN students st ON st.id = mp.student_id
         JOIN subject_catalog sc ON sc.id = mp.subject_id
-        LEFT JOIN contact_info ci ON ci.student_id = st.id
     ),
     attendance_rollup AS (
         SELECT
@@ -321,6 +331,14 @@ def _base_ctes(curriculum_credits: dict[str, float]) -> str:
           AND me.subject_code NOT ILIKE '24AC%'
         GROUP BY sg.student_id
     ),
+    arrears_rollup AS (
+        SELECT
+            me.student_id,
+            SUM(me.failed) AS active_arrears
+        FROM marks_enriched me
+        WHERE me.failed = 1
+        GROUP BY me.student_id
+    ),
     student_current AS (
         SELECT DISTINCT ON (st.id)
             st.id AS student_id,
@@ -330,24 +348,21 @@ def _base_ctes(curriculum_credits: dict[str, float]) -> str:
             st.name AS student_name,
             st.batch,
             st.current_semester,
-            COALESCE(ci.email, st.email) AS email,
-            ci.city,
+            st.email,
+            st.city,
             COALESCE(ar.attendance_percentage, 0) AS attendance_percentage,
             COALESCE(cg.cgpa, v.sgpa, 0) AS cgpa_proxy,
             v.internal_avg AS internal_avg,
             COALESCE(v.gpa_velocity, 0) AS gpa_velocity,
             COALESCE(v.previous_sgpa, v.sgpa, 0) AS previous_sgpa,
-            COALESCE((
-                SELECT COUNT(*) FROM marks_enriched m2
-                WHERE m2.student_id = st.id AND m2.failed = 1
-            ), 0) AS active_arrears,
+            COALESCE(arr.active_arrears, 0) AS active_arrears,
             u.is_initial_password
         FROM students st
         JOIN users u ON u.id = st.id
-        LEFT JOIN contact_info ci ON ci.student_id = st.id
         LEFT JOIN attendance_rollup ar ON ar.student_id = st.id
         LEFT JOIN cumulative_gpa cg ON cg.student_id = st.id
         LEFT JOIN velocity v ON v.student_id = st.id AND v.semester = st.current_semester
+        LEFT JOIN arrears_rollup arr ON arr.student_id = st.id
         ORDER BY st.id, st.current_semester DESC
     ),
     risk_scores AS (
@@ -395,7 +410,7 @@ async def get_subject_leaderboard(
                 me.subject_code,
                 me.subject_name,
                 me.total_marks,
-                me.internal_marks,
+                me.effective_internal_marks AS internal_marks,
                 me.grade,
                 RANK() OVER (
                     PARTITION BY me.subject_code, me.batch, me.current_semester{section_partition}
@@ -467,7 +482,7 @@ async def get_subject_leaderboard(
                 me.subject_code,
                 me.subject_name,
                 me.total_marks,
-                me.internal_marks,
+                me.effective_internal_marks AS internal_marks,
                 me.grade,
                 RANK() OVER (
                     PARTITION BY me.subject_code, me.batch, me.current_semester{section_partition}
@@ -669,6 +684,11 @@ async def get_subject_catalog(db: AsyncSession) -> list[schemas.SubjectCatalogIt
         print(f"INFO: Threshold columns not found in database. Using default values. Error: {str(e)}")
         print("INFO: Run 'alembic upgrade head' to apply threshold management schema updates.")
         
+        # IMPORTANT: asyncpg requires a ROLLBACK after a failed query before any new queries
+        # can be run on the same connection. Without this, the session is in an aborted
+        # transaction state and will raise InterfaceError on the fallback query AND on close().
+        await db.rollback()
+        
         # Fallback to basic query without threshold columns (for pre-migration compatibility)
         query_basic = text(
             """
@@ -767,7 +787,7 @@ async def get_student_360(
         domain_scores AS (
             SELECT
                 dm.domain,
-                COALESCE(ROUND(
+                LEAST(COALESCE(ROUND(
                     AVG(
                         CASE
                             WHEN me.total_marks > 0 THEN me.total_marks
@@ -777,8 +797,8 @@ async def get_student_360(
                         END
                     ) FILTER (WHERE me.roll_no = :roll_no)::numeric,
                     2
-                ), 0) AS score,
-                COALESCE(MAX(cda.cohort_score), 0) AS cohort_score
+                ), 0), 100) AS score,
+                LEAST(COALESCE(MAX(cda.cohort_score), 0), 100) AS cohort_score
             FROM domain_master dm
             LEFT JOIN marks_enriched me ON COALESCE(me.skill_domain, 'Core') = dm.domain AND me.credit > 0
             LEFT JOIN cohort_domain_avg cda ON cda.domain = dm.domain
@@ -851,18 +871,12 @@ async def get_student_360(
                 me.semester,
                 me.grade,
                 me.total_marks,
-                me.internal_marks,
-                ROUND(
-                    CASE
-                        WHEN me.effective_internal_marks IS NULL THEN COALESCE(NULLIF(me.total_marks, 0), me.grade_point * 10)
-                        ELSE me.grade_point * 10 + me.effective_internal_marks
-                    END::numeric,
-                    2
-                ) AS score,
+                me.effective_internal_marks AS internal_marks,
+                COALESCE(me.total_marks, me.effective_internal_marks, me.grade_point * 10) AS score,
                 'Strong academic signal' AS note
             FROM marks_enriched me
             WHERE me.roll_no = :roll_no AND me.credit > 0
-            ORDER BY score DESC, me.total_marks DESC
+            ORDER BY score DESC NULLS LAST, me.total_marks DESC NULLS LAST
             LIMIT 4
         ),
         subject_support AS (
@@ -872,7 +886,7 @@ async def get_student_360(
                 me.semester,
                 me.grade,
                 me.total_marks,
-                me.internal_marks,
+                me.effective_internal_marks AS internal_marks,
                 ROUND(
                     CASE
                         WHEN me.total_marks > 0 THEN me.total_marks
@@ -976,13 +990,161 @@ async def get_student_360(
     if profile.get("current_semester") is None:
         logger.warning(f"Student {roll_no} missing current semester data")
     
+    # ── SPICS professional identity data ──────────────────────────────────────
+    student_id = student[0]
+    cte = f"""
+        SELECT
+            spp.github_username, spp.linkedin_url, spp.portfolio_url,
+            spp.leetcode_username, spp.hackerrank_username,
+            spp.primary_domain, spp.bio,
+            ROUND(spp.profile_completion_score::numeric, 2) AS profile_completion_score,
+            (SELECT COUNT(*) FROM student_projects sp WHERE sp.student_id = :sid2) AS project_count,
+            (SELECT COUNT(*) FROM student_skills sk WHERE sk.student_id = :sid3) AS skill_count,
+            (SELECT COUNT(*) FROM student_certifications sc WHERE sc.student_id = :sid4) AS cert_count,
+            (SELECT json_agg(json_build_object(
+                'project_id', sp2.project_id,
+                'title', sp2.title,
+                'tech_stack', sp2.tech_stack,
+                'github_url', sp2.github_url,
+                'complexity_level', sp2.complexity_level,
+                'completion_status', sp2.completion_status,
+                'verification_status', sp2.verification_status
+            )) FROM student_projects sp2 WHERE sp2.student_id = :sid5) AS projects_json,
+            (SELECT json_agg(json_build_object(
+                'skill_name', sk2.skill_name,
+                'category', sk2.category,
+                'proficiency_level', sk2.proficiency_level
+            )) FROM student_skills sk2 WHERE sk2.student_id = :sid6) AS skills_json,
+            (SELECT json_agg(json_build_object(
+                'title', sc2.title,
+                'provider', sc2.provider,
+                'verification_status', sc2.verification_status
+            )) FROM student_certifications sc2 WHERE sc2.student_id = :sid7) AS certs_json,
+            (SELECT row_to_json(gh) FROM (
+                SELECT spp.github_cache_data->>'public_repos' AS public_repos,
+                       spp.github_cache_data->>'followers' AS followers,
+                       spp.github_cache_data->>'total_stars' AS total_stars,
+                       spp.github_cache_data->'top_languages' AS top_languages,
+                       spp.github_cache_data->>'contribution_activity' AS contribution_activity
+            ) gh) AS github_json,
+            (SELECT json_build_object(
+                'total_projects', (SELECT COUNT(*) FROM student_projects WHERE student_id = spp.student_id),
+                'total_skills', (SELECT COUNT(*) FROM student_skills WHERE student_id = spp.student_id),
+                'total_certifications', (SELECT COUNT(*) FROM student_certifications WHERE student_id = spp.student_id),
+                'ai_career_readiness_score', (SELECT ai.career_readiness_score FROM ai_professional_insights ai WHERE ai.student_id = spp.student_id),
+                'has_github', spp.github_username IS NOT NULL,
+                'has_resume', spp.resume_file_path IS NOT NULL AND spp.resume_file_path != '',
+                'profile_completion_score', spp.profile_completion_score
+            )) AS readiness_json,
+            (SELECT row_to_json(ai) FROM (
+                SELECT
+                    ai2.ai_summary, ai2.strengths, ai2.improvement_areas,
+                    ai2.career_fit_roles, ai2.career_readiness_score
+                FROM ai_professional_insights ai2 WHERE ai2.student_id = :sid8
+            ) ai) AS ai_json
+        FROM student_professional_profiles spp
+        WHERE spp.student_id = :sid1
+    """
+    spics_row = (await db.execute(
+        text(cte),
+        {
+            "sid1": student_id, "sid2": student_id, "sid3": student_id, "sid4": student_id,
+            "sid5": student_id, "sid6": student_id, "sid7": student_id, "sid8": student_id,
+        }
+    )).mappings().first()
+
+    professional_profile = None
+    professional_projects = []
+    professional_skills = []
+    professional_certifications = []
+    github_analysis = None
+    career_readiness = None
+    ai_insights = None
+
+    if spics_row and spics_row.get("github_username") is not None:
+        professional_profile = schemas.ProfessionalProfileSummary(
+            github_username=spics_row.get("github_username"),
+            linkedin_url=spics_row.get("linkedin_url"),
+            portfolio_url=spics_row.get("portfolio_url"),
+            leetcode_username=spics_row.get("leetcode_username"),
+            hackerrank_username=spics_row.get("hackerrank_username"),
+            primary_domain=spics_row.get("primary_domain"),
+            bio=spics_row.get("bio"),
+            profile_completion_score=spics_row.get("profile_completion_score"),
+        )
+
+        projects_raw = spics_row.get("projects_json") or []
+        for p in projects_raw:
+            professional_projects.append(schemas.ProjectSummaryItem(**p))
+
+        skills_raw = spics_row.get("skills_json") or []
+        for s in skills_raw:
+            professional_skills.append(schemas.SkillSummaryItem(**s))
+
+        certs_raw = spics_row.get("certs_json") or []
+        for c in certs_raw:
+            professional_certifications.append(schemas.CertSummaryItem(**c))
+
+        gh_raw = spics_row.get("github_json")
+        if gh_raw:
+            github_analysis = schemas.GitHubAnalysisSummary(
+                public_repos=int(gh_raw.get("public_repos") or 0),
+                followers=int(gh_raw.get("followers") or 0),
+                total_stars=int(gh_raw.get("total_stars") or 0),
+                top_languages=gh_raw.get("top_languages"),
+                contribution_activity=gh_raw.get("contribution_activity"),
+            )
+
+        readiness_raw = spics_row.get("readiness_json")
+        if readiness_raw:
+            career_readiness = schemas.CareerReadinessSummary(
+                readiness_band=_readiness_band(readiness_raw),
+                total_projects=int(readiness_raw.get("total_projects") or 0),
+                total_skills=int(readiness_raw.get("total_skills") or 0),
+                total_certifications=int(readiness_raw.get("total_certifications") or 0),
+                ai_career_readiness_score=readiness_raw.get("ai_career_readiness_score"),
+                has_github=bool(readiness_raw.get("has_github")),
+                has_resume=bool(readiness_raw.get("has_resume")),
+            )
+
+        ai_raw = spics_row.get("ai_json")
+        if ai_raw:
+            ai_insights = schemas.AIInsightSummary(
+                ai_summary=ai_raw.get("ai_summary"),
+                strengths=ai_raw.get("strengths"),
+                improvement_areas=ai_raw.get("improvement_areas"),
+                career_fit_roles=ai_raw.get("career_fit_roles"),
+            )
+
+    # ── ASIE capability scores ─────────────────────────────────────────────────
+    cap_row = (await db.execute(
+        text("SELECT * FROM student_capability_scores WHERE student_id = :sid"),
+        {"sid": student_id},
+    )).mappings().first()
+    capability_scores = None
+    if cap_row:
+        capability_scores = schemas.CapabilityScoreSummary(
+            academic_score=float(cap_row["academic_score"]) if cap_row["academic_score"] is not None else None,
+            technical_score=float(cap_row["technical_score"]) if cap_row["technical_score"] is not None else None,
+            leadership_score=float(cap_row["leadership_score"]) if cap_row["leadership_score"] is not None else None,
+            sports_score=float(cap_row["sports_score"]) if cap_row["sports_score"] is not None else None,
+            creativity_score=float(cap_row["creativity_score"]) if cap_row["creativity_score"] is not None else None,
+            discipline_score=float(cap_row["discipline_score"]) if cap_row["discipline_score"] is not None else None,
+            communication_score=float(cap_row["communication_score"]) if cap_row["communication_score"] is not None else None,
+            consistency_score=float(cap_row["consistency_score"]) if cap_row["consistency_score"] is not None else None,
+            placement_score=float(cap_row["placement_score"]) if cap_row["placement_score"] is not None else None,
+            growth_score=float(cap_row["growth_score"]) if cap_row["growth_score"] is not None else None,
+            spi_score=float(cap_row["spi_score"]) if cap_row["spi_score"] is not None else None,
+            profile_type=cap_row.get("profile_type"),
+        )
+
     # Build and return response
     response = schemas.Student360Profile(
         roll_no=profile["roll_no"],
         reg_no=profile.get("reg_no"),
         student_name=profile["student_name"],
         batch=profile.get("batch"),
-        section=profile.get("section"),  # Now properly populated!
+        section=profile.get("section"),
         current_semester=profile.get("current_semester"),
         overall_gpa=overall_gpa,
         attendance_percentage=attendance_percentage,
@@ -1000,8 +1162,16 @@ async def get_student_360(
         peer_benchmark=schemas.StudentPeerBenchmark(**peer),
         risk_drivers=risk_drivers,
         recommended_actions=recommended_actions,
+        professional_profile=professional_profile,
+        professional_projects=professional_projects,
+        professional_skills=professional_skills,
+        professional_certifications=professional_certifications,
+        github_analysis=github_analysis,
+        career_readiness=career_readiness,
+        ai_insights=ai_insights,
+        capability_scores=capability_scores,
     )
-    
+
     logger.info(f"Successfully generated Student 360 profile for {roll_no}")
     return response
 
@@ -1169,7 +1339,7 @@ async def get_placement_readiness(
         coding_scores AS (
             SELECT
                 me.student_id,
-                ROUND(AVG(CASE WHEN {coding_filter} THEN COALESCE(me.total_marks, me.internal_marks) ELSE NULL END)::numeric, 2) AS coding_subject_score
+                ROUND(AVG(CASE WHEN {coding_filter} THEN COALESCE(me.total_marks, me.effective_internal_marks) ELSE NULL END)::numeric, 2) AS coding_subject_score
             FROM marks_enriched me
             GROUP BY me.student_id
         ),
@@ -1337,7 +1507,7 @@ async def _get_placement_summary(db: AsyncSession, curriculum_credits: dict[str,
         coding_scores AS (
             SELECT
                 me.student_id,
-                ROUND(AVG(CASE WHEN me.subject_name ~* :coding_patterns THEN COALESCE(me.total_marks, me.internal_marks) ELSE NULL END)::numeric, 2) AS coding_subject_score
+                ROUND(AVG(CASE WHEN me.subject_name ~* :coding_patterns THEN COALESCE(me.total_marks, me.effective_internal_marks) ELSE NULL END)::numeric, 2) AS coding_subject_score
             FROM marks_enriched me
             GROUP BY me.student_id
         )
@@ -1421,18 +1591,37 @@ async def _get_subject_coverage(db: AsyncSession) -> list[schemas.AdminSubjectCo
     return [schemas.AdminSubjectCoverage(**{key: int(row[key] or 0) for key in row.keys()}) for row in rows]
 
 
+async def _empty_spotlight() -> schemas.SpotlightSearchResponse:
+    return schemas.SpotlightSearchResponse(results=[])
+
+
 async def get_command_center(
     db: AsyncSession,
     curriculum_credits: dict[str, float],
     *,
     spotlight: str = "",
 ) -> schemas.AdminCommandCenterResponse:
+    import asyncio
     from .analytics_service import build_hod_dashboard
 
+    # Execute queries sequentially to prevent SQLAlchemy/asyncpg concurrent connection errors
     dashboard = await build_hod_dashboard(db, curriculum_credits)
+    directory = await _get_admin_directory_rollup(db, curriculum_credits)
+    subject_catalog = await get_subject_catalog(db)
+    bottlenecks = await get_subject_bottlenecks(db, curriculum_credits, subject_code=None, limit=6, offset=0, sort_by="failure_rate")
+    faculty = await get_faculty_impact_matrix(db, curriculum_credits, subject_code=None, faculty_id=None, limit=6, offset=0)
+    placements = await get_placement_readiness(db, curriculum_credits, cgpa_threshold=6.5, limit=8, offset=0, sort_by="cgpa")
+    watchlist = await get_risk_registry(db, curriculum_credits, risk_level=None, limit=8, offset=0, sort_by="risk_score")
+    batch_health = await _get_batch_health(db, curriculum_credits)
+    semester_pulse = await _get_semester_pulse(db, curriculum_credits)
+    risk_summary = await _get_risk_summary(db, curriculum_credits)
+    placement_summary = await _get_placement_summary(db, curriculum_credits)
+    leaderboard_snapshots = await _get_leaderboard_snapshots(db, curriculum_credits)
+    subject_coverage = await _get_subject_coverage(db)
+    spotlight_results = await spotlight_search(db, query=spotlight, limit=8) if spotlight else await _empty_spotlight()
+
+
     # Patch: propagate new analytics fields to top-level response for admin dashboard
-    # If dashboard.directory or dashboard.risk_students contain per-subject marks, map new fields
-    # (Assume downstream consumers expect these fields in marks or subject performance lists)
     for student in getattr(dashboard, 'directory', []):
         if hasattr(student, 'marks'):
             for mark in student.marks:
@@ -1445,19 +1634,6 @@ async def get_command_center(
                 mark.percentile = getattr(mark, 'percentile', None)
                 mark.normalized_score = getattr(mark, 'normalized_score', None)
                 mark.performance_label = getattr(mark, 'performance_label', None)
-    directory = await _get_admin_directory_rollup(db, curriculum_credits)
-    subject_catalog = await get_subject_catalog(db)
-    bottlenecks = await get_subject_bottlenecks(db, curriculum_credits, subject_code=None, limit=6, offset=0, sort_by="failure_rate")
-    faculty = await get_faculty_impact_matrix(db, curriculum_credits, subject_code=None, faculty_id=None, limit=6, offset=0)
-    placements = await get_placement_readiness(db, curriculum_credits, cgpa_threshold=6.5, limit=8, offset=0, sort_by="cgpa")
-    watchlist = await get_risk_registry(db, curriculum_credits, risk_level=None, limit=8, offset=0, sort_by="risk_score")
-    spotlight_results = await spotlight_search(db, query=spotlight, limit=8) if spotlight else schemas.SpotlightSearchResponse(results=[])
-    batch_health = await _get_batch_health(db, curriculum_credits)
-    semester_pulse = await _get_semester_pulse(db, curriculum_credits)
-    risk_summary = await _get_risk_summary(db, curriculum_credits)
-    placement_summary = await _get_placement_summary(db, curriculum_credits)
-    leaderboard_snapshots = await _get_leaderboard_snapshots(db, curriculum_credits)
-    subject_coverage = await _get_subject_coverage(db)
 
     alerts: list[str] = []
     for student in dashboard.risk_students[:4]:

@@ -14,6 +14,9 @@ async def check_threshold_columns_exist(db: AsyncSession) -> bool:
         await db.execute(test_query)
         return True
     except (ProgrammingError, Exception):
+        # asyncpg leaves the connection in an aborted transaction after a failed query.
+        # Rollback so the session is usable for subsequent queries by the caller.
+        await db.rollback()
         return False
 
 

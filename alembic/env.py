@@ -13,6 +13,8 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')
 # Import engine and settings
 from app.core.database import engine, Base, settings
 from app.models import base # Ensure models are registered
+from app.professional_identity.models import models as _pi_models  # noqa: F401 — registers SPICS tables
+
 
 # this is the Alembic Config object, which provides
 # access to the values within the .ini file in use.

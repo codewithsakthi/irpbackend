@@ -12,9 +12,12 @@ from ...services.student_service import StudentService
 from ...models import base as models
 from ...schemas import base as schemas
 from ...services.admin_service import AdminService
+from ...services.intelligence_engine import StudentIntelligenceEngine
 from ...core.limiter import limiter
+from ...professional_identity.models.models import AIProfessionalInsight
 from ...services import enterprise_analytics
 from sqlalchemy import select, update, delete, func, text, case as sql_case, and_
+from sqlalchemy.orm import joinedload
 
 router = APIRouter(tags=["Admin"])
 
@@ -1080,6 +1083,52 @@ async def export_student_resume(
     content = await enterprise_analytics.export_student_resume_pdf(db, CURRICULUM_CREDITS, roll_no=roll_no)
     return content
 
+@router.get(
+    "/export/uploaded-resume/{roll_no}",
+    summary="Get Uploaded Resume File",
+    description="Serve the actual resume file uploaded by the student via SPICS.",
+)
+async def serve_uploaded_resume(
+    roll_no: str = Path(...),
+    current_user: models.User = Depends(auth.get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    from fastapi.responses import FileResponse
+    from pathlib import Path
+    require_admin(current_user)
+    # Look up student id from roll_no
+    row = (await db.execute(
+        text("SELECT id FROM students WHERE roll_no = :r"),
+        {"r": roll_no.strip().upper()},
+    )).first()
+    if not row:
+        raise HTTPException(status_code=404, detail="Student not found")
+    student_id = row[0]
+    # Query SPICS profile for resume_file_path
+    prof = (await db.execute(
+        text("SELECT resume_file_path FROM student_professional_profiles WHERE student_id = :sid"),
+        {"sid": student_id},
+    )).first()
+    if not prof or not prof[0]:
+        raise HTTPException(status_code=404, detail="No resume uploaded by this student")
+    from ...professional_identity.utils.utils import UPLOAD_BASE
+    file_path = Path(prof[0])
+    uploads_root = UPLOAD_BASE if UPLOAD_BASE.is_absolute() else (Path.cwd() / UPLOAD_BASE)
+    uploads_root = uploads_root.resolve()
+    full_path = file_path if file_path.is_absolute() else (Path.cwd() / file_path)
+    full_path = full_path.resolve()
+    if uploads_root not in full_path.parents and full_path != uploads_root:
+        raise HTTPException(status_code=400, detail="Invalid resume file path")
+    if not full_path.exists() or not full_path.is_file():
+        raise HTTPException(status_code=404, detail="Resume file not found on server")
+    suffix = full_path.suffix.lower()
+    media_type = "application/octet-stream"
+    if suffix == ".pdf":
+        media_type = "application/pdf"
+    elif suffix in {".doc", ".docx"}:
+        media_type = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+    return FileResponse(path=str(full_path), media_type=media_type, filename=full_path.name)
+
 @router.get("/students", response_model=list[schemas.AdminDirectoryStudent])
 async def get_admin_students(
     current_user: models.User = Depends(auth.get_current_user),
@@ -1100,8 +1149,21 @@ async def get_admin_students(
     """
     require_admin(current_user)
     credits_values = ", ".join(f"('{code}', {credit})" for code, credit in CURRICULUM_CREDITS.items())
-    directory = await AdminService.build_admin_directory(db, credits_values)
-    return AdminService.filter_admin_directory(directory, search, city, batch, semester, section, risk_only, sort_by.value, sort_dir, limit)
+    items, _ = await AdminService.build_admin_directory_paginated(
+        db=db,
+        credits_cte_values=credits_values,
+        search=search,
+        city=city,
+        batch=batch,
+        semester=semester,
+        section=section,
+        risk_only=risk_only,
+        sort_by=sort_by.value,
+        sort_dir=sort_dir.value,
+        limit=limit,
+        offset=0
+    )
+    return items
 
 @router.get("/students/paginated", response_model=schemas.AdminDirectoryPage)
 async def get_admin_students_paginated(
@@ -1123,12 +1185,23 @@ async def get_admin_students_paginated(
     """
     require_admin(current_user)
     credits_values = ", ".join(f"('{code}', {credit})" for code, credit in CURRICULUM_CREDITS.items())
-    directory = await AdminService.build_admin_directory(db, credits_values)
-    filtered = AdminService.filter_admin_directory(directory, search, city, batch, semester, section, risk_only, sort_by.value, sort_dir, 1000)
-    items = filtered[offset : offset + limit]
+    items, total = await AdminService.build_admin_directory_paginated(
+        db=db,
+        credits_cte_values=credits_values,
+        search=search,
+        city=city,
+        batch=batch,
+        semester=semester,
+        section=section,
+        risk_only=risk_only,
+        sort_by=sort_by.value,
+        sort_dir=sort_dir.value,
+        limit=limit,
+        offset=offset
+    )
     return schemas.AdminDirectoryPage(
         items=items,
-        pagination=schemas.PaginationMeta(total=len(filtered), limit=limit, offset=offset)
+        pagination=schemas.PaginationMeta(total=total, limit=limit, offset=offset)
     )
 
 @router.get("/spotlight-search", response_model=schemas.SpotlightSearchResponse)
@@ -2049,3 +2122,346 @@ async def debug_subjects(
         "inactive_subjects": total_count - active_count,
         "sample_subjects": sample_subjects
     }
+
+# --- ASIE ADMIN ENDPOINTS ---
+
+@router.get(
+    "/talent-matrix",
+    response_model=schemas.AdminTalentMatrixResponse,
+    summary="Get Cohort Talent Matrix",
+    description="Retrieve the 9-box performance vs potential cohort talent matrix."
+)
+async def get_talent_matrix(
+    current_user: models.User = Depends(auth.get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    require_admin(current_user)
+    
+    # Fetch all students eagerly loaded with assessments and subjects to avoid lazy load MissingGreenlet
+    students_res = await db.execute(
+        select(models.Student)
+        .options(
+            joinedload(models.Student.assessments).joinedload(models.StudentAssessment.subject)
+        )
+    )
+    students = students_res.unique().scalars().all()
+    
+    # Batch-fetch SPICS professional identity data for all students
+    student_ids = [s.id for s in students]
+    spics_map = {}
+    if student_ids:
+        spics_rows = (await db.execute(text("""
+            SELECT 
+                spp.student_id,
+                ROUND(spp.profile_completion_score::numeric, 2) AS profile_completion_score,
+                spp.github_username,
+                (SELECT COUNT(*) FROM student_projects sp WHERE sp.student_id = spp.student_id) AS projects_count,
+                (SELECT COUNT(*) FROM student_skills sk WHERE sk.student_id = spp.student_id) AS skills_count,
+                (SELECT COUNT(*) FROM student_certifications sc WHERE sc.student_id = spp.student_id) AS certs_count,
+                (SELECT ai.career_readiness_score FROM ai_professional_insights ai WHERE ai.student_id = spp.student_id) AS career_readiness_score
+            FROM student_professional_profiles spp
+            WHERE spp.student_id = ANY(:sids)
+        """), {"sids": student_ids})).mappings().all()
+        for row in spics_rows:
+            spics_map[row["student_id"]] = row
+
+    items = []
+    quadrant_counts = {
+        "Star Performer": 0,
+        "Academic Pillar": 0,
+        "Curriculum Specialist": 0,
+        "High Potential Leader": 0,
+        "Balanced Core": 0,
+        "Solid Contributor": 0,
+        "Hidden Talent": 0,
+        "Growth Candidate": 0,
+        "Needs Developmental Support": 0
+    }
+    
+    for student in students:
+        cap_score = await db.get(models.StudentCapabilityScore, student.id)
+        if not cap_score:
+            # Generate deterministic scores on the fly and cache (bypassing slow AI for fast load)
+            dna = await StudentIntelligenceEngine.analyze_and_cache_student(student.id, db, bypass_ai=True)
+            academic = float(dna.capability_scores.academic_score)
+            spi = float(dna.spi_score)
+            profile_type = dna.profile_type
+        else:
+            academic = float(cap_score.academic_score)
+            spi = float(cap_score.spi_score)
+            profile_type = cap_score.profile_type or "Balanced Performer"
+            
+        # Fetch CGPA Proxy
+        analytics = await StudentService.calculate_analytics(student, db)
+        cgpa = float(analytics.average_grade_points)
+        
+        # Classify into 9-box matrix quadrants
+        if academic >= 80:
+            x_band = "High"
+        elif academic >= 60:
+            x_band = "Medium"
+        else:
+            x_band = "Low"
+            
+        if spi >= 80:
+            y_band = "High"
+        elif spi >= 60:
+            y_band = "Medium"
+        else:
+            y_band = "Low"
+            
+        if x_band == "High" and y_band == "High":
+            quadrant = "Star Performer"
+        elif x_band == "High" and y_band == "Medium":
+            quadrant = "Academic Pillar"
+        elif x_band == "High" and y_band == "Low":
+            quadrant = "Curriculum Specialist"
+        elif x_band == "Medium" and y_band == "High":
+            quadrant = "High Potential Leader"
+        elif x_band == "Medium" and y_band == "Medium":
+            quadrant = "Balanced Core"
+        elif x_band == "Medium" and y_band == "Low":
+            quadrant = "Solid Contributor"
+        elif x_band == "Low" and y_band == "High":
+            quadrant = "Hidden Talent"
+        elif x_band == "Low" and y_band == "Medium":
+            quadrant = "Growth Candidate"
+        else:
+            quadrant = "Needs Developmental Support"
+            
+        quadrant_counts[quadrant] += 1
+        
+        sp_data = spics_map.get(student.id, {})
+        items.append(schemas.AdminTalentMatrixItem(
+            roll_no=student.roll_no,
+            name=student.name,
+            academic_score=academic,
+            spi_score=spi,
+            profile_type=profile_type,
+            quadrant=quadrant,
+            cgpa=cgpa,
+            profile_completion_score=sp_data.get("profile_completion_score"),
+            projects_count=int(sp_data.get("projects_count") or 0),
+            skills_count=int(sp_data.get("skills_count") or 0),
+            certifications_count=int(sp_data.get("certs_count") or 0),
+            career_readiness_score=sp_data.get("career_readiness_score"),
+            github_connected=bool(sp_data.get("github_username")),
+        ))
+        
+    return schemas.AdminTalentMatrixResponse(items=items, quadrant_counts=quadrant_counts)
+
+@router.get(
+    "/hidden-talents",
+    response_model=schemas.AdminHiddenTalentsResponse,
+    summary="Get Hidden Talents",
+    description="Retrieve students with lower CGPA but outstanding technical or extracurricular scores."
+)
+async def get_hidden_talents(
+    current_user: models.User = Depends(auth.get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    require_admin(current_user)
+    
+    # Fetch all students eagerly loaded with assessments and subjects to avoid lazy load MissingGreenlet
+    students_res = await db.execute(
+        select(models.Student)
+        .options(
+            joinedload(models.Student.assessments).joinedload(models.StudentAssessment.subject)
+        )
+    )
+    students = students_res.unique().scalars().all()
+    
+    items = []
+    for student in students:
+        cap_score = await db.get(models.StudentCapabilityScore, student.id)
+        if not cap_score:
+            # Generate deterministic scores
+            dna = await StudentIntelligenceEngine.analyze_and_cache_student(student.id, db, bypass_ai=True)
+            cap_dto = dna.capability_scores
+            profile_type = dna.profile_type
+        else:
+            cap_dto = schemas.StudentCapabilityScoreResponse.model_validate(cap_score)
+            profile_type = cap_score.profile_type or "Balanced Performer"
+            
+        analytics = await StudentService.calculate_analytics(student, db)
+        cgpa = float(analytics.average_grade_points)
+        
+        # Condition: lower CGPA but outstanding soft-skills/tech (score >= 75 in tech, leadership, sports, or creativity)
+        if cgpa < 7.0:
+            outstanding = []
+            if cap_dto.technical_score >= 75:
+                outstanding.append(f"Technical ({cap_dto.technical_score:.0f})")
+            if cap_dto.leadership_score >= 75:
+                outstanding.append(f"Leadership ({cap_dto.leadership_score:.0f})")
+            if cap_dto.sports_score >= 75:
+                outstanding.append(f"Sports ({cap_dto.sports_score:.0f})")
+            if cap_dto.creativity_score >= 75:
+                outstanding.append(f"Creativity ({cap_dto.creativity_score:.0f})")
+                
+            if outstanding:
+                ec_count = await db.scalar(
+                    select(func.count(models.ExtraCurricular.activity_id))
+                    .filter(models.ExtraCurricular.student_id == student.id)
+                ) or 0
+                
+                reason = f"Lower academic proxy ({cgpa:.2f}) but shows exceptional strengths in: {', '.join(outstanding)}."
+                items.append(schemas.AdminHiddenTalentItem(
+                    roll_no=student.roll_no,
+                    name=student.name,
+                    cgpa=cgpa,
+                    technical_score=float(cap_dto.technical_score),
+                    leadership_score=float(cap_dto.leadership_score),
+                    sports_score=float(cap_dto.sports_score),
+                    creativity_score=float(cap_dto.creativity_score),
+                    extra_curricular_count=ec_count,
+                    highlight_reason=reason
+                ))
+                
+    return schemas.AdminHiddenTalentsResponse(items=items)
+
+@router.get(
+    "/high-potential",
+    response_model=schemas.AdminHighPotentialResponse,
+    summary="Get High Potential Students",
+    description="Retrieve students with high SPI (Student Potential Index)."
+)
+async def get_high_potential(
+    current_user: models.User = Depends(auth.get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    require_admin(current_user)
+    
+    matrix = await get_talent_matrix(current_user, db)
+    # Filter SPI score >= 70, order by SPI descending
+    high_potentials = [item for item in matrix.items if item.spi_score >= 70]
+    high_potentials.sort(key=lambda x: x.spi_score, reverse=True)
+    
+    return schemas.AdminHighPotentialResponse(items=high_potentials)
+
+@router.get(
+    "/intervention-engine",
+    response_model=schemas.AdminInterventionResponse,
+    summary="ASIE Intervention Engine",
+    description="Identify students needing developmental support with risk analysis and suggested actions."
+)
+async def get_intervention_engine(
+    current_user: models.User = Depends(auth.get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    require_admin(current_user)
+    
+    # Fetch all students eagerly loaded with assessments and subjects to avoid lazy load MissingGreenlet
+    students_res = await db.execute(
+        select(models.Student)
+        .options(
+            joinedload(models.Student.assessments).joinedload(models.StudentAssessment.subject)
+        )
+    )
+    students = students_res.unique().scalars().all()
+    
+    items = []
+    for student in students:
+        cap_score = await db.get(models.StudentCapabilityScore, student.id)
+        if not cap_score:
+            dna = await StudentIntelligenceEngine.analyze_and_cache_student(student.id, db, bypass_ai=True)
+            cap_dto = dna.capability_scores
+            profile_type = dna.profile_type
+        else:
+            cap_dto = schemas.StudentCapabilityScoreResponse.model_validate(cap_score)
+            profile_type = cap_score.profile_type or "Balanced Performer"
+            
+        analytics = await StudentService.calculate_analytics(student, db)
+        cgpa = float(analytics.average_grade_points)
+        attendance = float(analytics.attendance.percentage)
+        
+        # Criteria: profile is Needs Support or Academic/Discipline score < 50
+        if profile_type == "Needs Support" or cap_dto.academic_score < 50 or cap_dto.discipline_score < 50:
+            # Calculate Risk Level
+            if cap_dto.academic_score < 40 or attendance < 65:
+                risk_level = "Critical"
+                action = "Initiate formal counseling diary meeting and draft an academic recovery plan."
+            elif cap_dto.academic_score < 50 or attendance < 75:
+                risk_level = "High"
+                action = "Schedule peer tutoring sessions and alert class counselor."
+            else:
+                risk_level = "Moderate"
+                action = "Monitor closely and request regular attendance reviews."
+                
+            items.append(schemas.AdminInterventionItem(
+                roll_no=student.roll_no,
+                name=student.name,
+                cgpa=cgpa,
+                attendance_percentage=attendance,
+                academic_score=float(cap_dto.academic_score),
+                discipline_score=float(cap_dto.discipline_score),
+                profile_type=profile_type,
+                suggested_action=action,
+                risk_level=risk_level
+            ))
+            
+    return schemas.AdminInterventionResponse(items=items)
+
+@router.get(
+    "/career-distribution",
+    response_model=schemas.AdminCareerDistributionResponse,
+    summary="Get Career Fit Distribution",
+    description="Retrieve cohort aggregate of predicted career fit distributions."
+)
+async def get_career_distribution(
+    current_user: models.User = Depends(auth.get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    require_admin(current_user)
+    
+    profiles_res = await db.execute(select(AIProfessionalInsight))
+    profiles = profiles_res.scalars().all()
+    
+    domain_counts = {}
+    total_fit_records = 0
+    
+    # Pre-calculated distribution from AI career fit mappings
+    for profile in profiles:
+        career_fit = profile.career_fit_roles or []
+        if career_fit:
+            # Find domain with highest match percentage for this student
+            sorted_fits = sorted(career_fit, key=lambda x: x.get("match_percentage", 0.0), reverse=True)
+            if sorted_fits:
+                top_domain = sorted_fits[0].get("domain", "General Operations")
+                domain_counts[top_domain] = domain_counts.get(top_domain, 0) + 1
+                total_fit_records += 1
+                
+    # Fallback to heuristics if AI profiles aren't populated yet
+    if total_fit_records == 0:
+        students_res = await db.execute(select(models.Student))
+        students = students_res.scalars().all()
+        for student in students:
+            cap_score = await db.get(models.StudentCapabilityScore, student.id)
+            if cap_score:
+                tech = float(cap_score.technical_score)
+                lead = float(cap_score.leadership_score)
+                academic = float(cap_score.academic_score)
+                
+                # Simple heuristic choice
+                if tech >= 75:
+                    top_domain = "Software Engineering"
+                elif lead >= 70:
+                    top_domain = "Product Management"
+                elif academic >= 75:
+                    top_domain = "Research"
+                else:
+                    top_domain = "Operations"
+                    
+                domain_counts[top_domain] = domain_counts.get(top_domain, 0) + 1
+                total_fit_records += 1
+                
+    distribution = []
+    for domain, count in domain_counts.items():
+        percentage = (count / total_fit_records * 100.0) if total_fit_records > 0 else 0.0
+        distribution.append(schemas.CareerDistributionItem(
+            domain=domain,
+            count=count,
+            percentage=round(percentage, 1)
+        ))
+        
+    distribution.sort(key=lambda x: x.count, reverse=True)
+    return schemas.AdminCareerDistributionResponse(distribution=distribution)

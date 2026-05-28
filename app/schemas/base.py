@@ -1,7 +1,7 @@
 from __future__ import annotations
 import datetime as dt
 from datetime import date, datetime
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator
 
@@ -123,7 +123,7 @@ class Student(StudentBase):
 
 class AssessmentBase(BaseModel):
     semester: int
-    assessment_type: str = Field(..., pattern='^(CIT1|CIT2|CIT3|SEMESTER_EXAM)$')
+    assessment_type: str = Field(..., pattern='^(CIT1|CIT2|CIT3|SEMESTER_EXAM|LAB|PROJECT)$')
     marks: Optional[float] = None
     attempt: int = 1
     remarks: Optional[str] = None
@@ -156,7 +156,7 @@ class Subject(BaseModel):
     
     # Threshold configuration for hybrid performance evaluation
     pass_threshold: float = 50.0
-    target_average: Optional[float] = 75.0
+    target_average: Optional[float] = None
     percentile_excellent: float = 85.0
     percentile_good: float = 60.0
     percentile_average: float = 30.0
@@ -180,7 +180,7 @@ class StaffAttendanceCreate(BaseModel):
     """Legacy schema — kept for backwards compatibility."""
     subject_id: int
     date: date
-    hour: int = Field(ge=1, le=7)
+    period: int = Field(ge=1, le=7)
     absentees: List[str] = Field(default_factory=list)
     section: str = "A"
     semester: int
@@ -498,6 +498,8 @@ class AdminAnalyticsResponse(BaseModel):
 
 
 class ContactInfoRecord(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
     address: Optional[str] = None
     pincode: Optional[str] = None
     phone_primary: Optional[str] = None
@@ -508,6 +510,8 @@ class ContactInfoRecord(BaseModel):
 
 
 class FamilyDetailsRecord(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
     father_name: Optional[str] = None
     mother_name: Optional[str] = None
     parent_occupation: Optional[str] = None
@@ -522,6 +526,8 @@ class FamilyDetailsRecord(BaseModel):
 
 
 class PreviousAcademicRecord(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
     school_name: Optional[str] = None
     institution: Optional[str] = None
     board_university: Optional[str] = None
@@ -530,6 +536,8 @@ class PreviousAcademicRecord(BaseModel):
 
 
 class ExtraCurricularRecord(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
     category: Optional[str] = None
     description: Optional[str] = None
     year: Optional[str] = None
@@ -537,6 +545,7 @@ class ExtraCurricularRecord(BaseModel):
 
 
 class CounselorDiaryRecord(BaseModel):
+    meeting_id: Optional[int] = None
     semester: Optional[int] = None
     meeting_date: Optional[date] = None
     remark_category: Optional[str] = None
@@ -879,7 +888,7 @@ class SubjectCatalogItem(BaseModel):
     
     # Include threshold info in catalog for admin management
     pass_threshold: float = 50.0
-    target_average: Optional[float] = 75.0
+    target_average: Optional[float] = None
     percentile_excellent: float = 85.0
     percentile_good: float = 60.0
     percentile_average: float = 30.0
@@ -968,8 +977,15 @@ class StudentSkillDomainScore(BaseModel):
     model_config = ConfigDict(extra='forbid')
 
     domain: str
-    score: float = Field(ge=0, le=100)
-    cohort_score: Optional[float] = Field(default=None, ge=0, le=100)
+    score: float = Field(ge=0)
+    cohort_score: Optional[float] = Field(default=None, ge=0)
+
+    @field_validator('score', 'cohort_score', mode='before')
+    @classmethod
+    def clamp_to_100(cls, v):
+        if v is None:
+            return v
+        return min(float(v), 100.0)
 
 
 class StudentSubjectHighlight(BaseModel):
@@ -1028,6 +1044,107 @@ class Student360Profile(BaseModel):
     peer_benchmark: StudentPeerBenchmark
     risk_drivers: List[StudentRiskDriver] = Field(default_factory=list)
     recommended_actions: List[str] = Field(default_factory=list)
+    # SPICS professional identity fields
+    professional_profile: Optional[ProfessionalProfileSummary] = None
+    professional_projects: List[ProjectSummaryItem] = Field(default_factory=list)
+    professional_skills: List[SkillSummaryItem] = Field(default_factory=list)
+    professional_certifications: List[CertSummaryItem] = Field(default_factory=list)
+    github_analysis: Optional[GitHubAnalysisSummary] = None
+    career_readiness: Optional[CareerReadinessSummary] = None
+    ai_insights: Optional[AIInsightSummary] = None
+    # ASIE capability scores
+    capability_scores: Optional["CapabilityScoreSummary"] = None
+
+
+class CapabilityScoreSummary(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+
+    academic_score: Optional[float] = None
+    technical_score: Optional[float] = None
+    leadership_score: Optional[float] = None
+    sports_score: Optional[float] = None
+    creativity_score: Optional[float] = None
+    discipline_score: Optional[float] = None
+    communication_score: Optional[float] = None
+    consistency_score: Optional[float] = None
+    placement_score: Optional[float] = None
+    growth_score: Optional[float] = None
+    spi_score: Optional[float] = None
+    profile_type: Optional[str] = None
+
+
+# ── SPICS (Professional Identity) summary schemas for admin views ──────────────
+
+class ProfessionalProfileSummary(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+
+    github_username: Optional[str] = None
+    linkedin_url: Optional[str] = None
+    portfolio_url: Optional[str] = None
+    leetcode_username: Optional[str] = None
+    hackerrank_username: Optional[str] = None
+    primary_domain: Optional[str] = None
+    bio: Optional[str] = None
+    profile_completion_score: Optional[float] = None
+
+
+class ProjectSummaryItem(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+
+    project_id: int
+    title: str
+    tech_stack: Optional[List[str]] = None
+    github_url: Optional[str] = None
+    complexity_level: Optional[str] = None
+    completion_status: Optional[str] = None
+    verification_status: Optional[str] = None
+
+
+class SkillSummaryItem(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+
+    skill_name: str
+    category: Optional[str] = None
+    proficiency_level: Optional[str] = None
+
+
+class CertSummaryItem(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+
+    title: str
+    provider: Optional[str] = None
+    verification_status: Optional[str] = None
+
+
+class GitHubAnalysisSummary(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+
+    public_repos: int = 0
+    followers: int = 0
+    total_stars: int = 0
+    top_languages: Optional[Dict[str, int]] = None
+    contribution_activity: Optional[str] = None
+
+
+class CareerReadinessSummary(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+
+    readiness_band: Optional[str] = None
+    total_projects: int = 0
+    total_skills: int = 0
+    total_certifications: int = 0
+    ai_career_readiness_score: Optional[float] = None
+    has_github: bool = False
+    has_resume: bool = False
+
+
+class AIInsightSummary(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+
+    ai_summary: Optional[str] = None
+    strengths: Optional[List[str]] = None
+    improvement_areas: Optional[List[str]] = None
+    career_fit_roles: Optional[List[dict]] = None
 
 
 class SubjectBottleneckItem(BaseModel):
@@ -1086,6 +1203,13 @@ class PlacementCandidate(BaseModel):
     coding_subject_score: float = Field(ge=0, le=100)
     attendance_percentage: float = Field(ge=0, le=100)
     placement_ready: bool
+
+    @field_validator('coding_subject_score', mode='before')
+    @classmethod
+    def clamp_to_100(cls, v):
+        if v is None:
+            return 0.0
+        return min(float(v), 100.0)
 
 
 class PlacementReadinessResponse(BaseModel):
@@ -1463,3 +1587,142 @@ class TimetableListResponse(BaseModel):
     total: int
     batch: Optional[str] = None
     section: Optional[str] = None
+
+class StudentCapabilityScoreResponse(BaseModel):
+    academic_score: float
+    communication_score: float
+    leadership_score: float
+    technical_score: float
+    creativity_score: float
+    sports_score: float
+    discipline_score: float
+    consistency_score: float
+    placement_score: float
+    growth_score: float
+    spi_score: float
+    profile_type: Optional[str] = None
+    updated_at: Optional[datetime] = None
+
+    class Config:
+        from_attributes = True
+
+class CareerFitItem(BaseModel):
+    domain: str
+    match_percentage: float
+    explanation: str
+
+class StudentAIProfileResponse(BaseModel):
+    primary_identity: Optional[str] = None
+    secondary_identity: Optional[str] = None
+    strengths: List[str] = Field(default_factory=list)
+    weaknesses: List[str] = Field(default_factory=list)
+    recommendations: List[str] = Field(default_factory=list)
+    placement_probability: float
+    career_fit: List[CareerFitItem] = Field(default_factory=list)
+    ai_summary: Optional[str] = None
+    confidence_score: float
+    generated_at: Optional[datetime] = None
+
+    class Config:
+        from_attributes = True
+
+class StudentGrowthHistoryResponse(BaseModel):
+    semester: int
+    spi_score: float
+    growth_delta: float
+    generated_at: Optional[datetime] = None
+
+    class Config:
+        from_attributes = True
+
+class StudentDNAResponse(BaseModel):
+    roll_no: str
+    student_name: str
+    capability_scores: StudentCapabilityScoreResponse
+    ai_profile: Optional[StudentAIProfileResponse] = None
+    spi_score: float
+    profile_type: str
+
+class CareerFitResponse(BaseModel):
+    roll_no: str
+    student_name: str
+    career_fit: List[CareerFitItem]
+    ai_explanation: Optional[str] = None
+
+class PotentialIndexResponse(BaseModel):
+    roll_no: str
+    student_name: str
+    current_spi: float
+    growth_history: List[StudentGrowthHistoryResponse]
+    peer_percentile: float
+    status_label: str  # e.g., 'Rising', 'Consistent', 'Intervention Needed'
+
+class AISummaryResponse(BaseModel):
+    roll_no: str
+    student_name: str
+    primary_identity: str
+    secondary_identity: str
+    strengths: List[str]
+    weaknesses: List[str]
+    recommendations: List[str]
+    ai_summary: str
+    confidence_score: float
+
+class AdminTalentMatrixItem(BaseModel):
+    roll_no: str
+    name: str
+    academic_score: float
+    spi_score: float
+    profile_type: str
+    quadrant: str  # e.g. "High Potential", "Star Performer", "Needs Support", etc.
+    cgpa: float
+    # SPICS professional identity fields
+    profile_completion_score: Optional[float] = None
+    projects_count: int = 0
+    skills_count: int = 0
+    certifications_count: int = 0
+    career_readiness_score: Optional[float] = None
+    github_connected: bool = False
+
+class AdminTalentMatrixResponse(BaseModel):
+    items: List[AdminTalentMatrixItem]
+    quadrant_counts: dict[str, int]
+
+class AdminHiddenTalentItem(BaseModel):
+    roll_no: str
+    name: str
+    cgpa: float
+    technical_score: float
+    leadership_score: float
+    sports_score: float
+    creativity_score: float
+    extra_curricular_count: int
+    highlight_reason: str
+
+class AdminHiddenTalentsResponse(BaseModel):
+    items: List[AdminHiddenTalentItem]
+
+class AdminHighPotentialResponse(BaseModel):
+    items: List[AdminTalentMatrixItem]
+
+class AdminInterventionItem(BaseModel):
+    roll_no: str
+    name: str
+    cgpa: float
+    attendance_percentage: float
+    academic_score: float
+    discipline_score: float
+    profile_type: str
+    suggested_action: str
+    risk_level: str
+
+class AdminInterventionResponse(BaseModel):
+    items: List[AdminInterventionItem]
+
+class CareerDistributionItem(BaseModel):
+    domain: str
+    count: int
+    percentage: float
+
+class AdminCareerDistributionResponse(BaseModel):
+    distribution: List[CareerDistributionItem]

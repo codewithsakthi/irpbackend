@@ -128,5 +128,9 @@ async def get_db():
     async with AsyncSessionLocal() as session:
         try:
             yield session
-        finally:
-            await session.close()
+        except Exception:
+            # Explicitly rollback before close to prevent asyncpg
+            # InterfaceError("cannot perform operation: another operation is in progress")
+            # which occurs when close() tries to rollback a connection mid-operation.
+            await session.rollback()
+            raise
