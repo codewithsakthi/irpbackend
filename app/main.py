@@ -69,9 +69,21 @@ allowed_origins = [
     "http://localhost:5173",
     "http://127.0.0.1:5173",
     "http://192.168.1.4:5173",
+    "https://irp-frontend.vercel.app",
 ]
 if settings.CORS_ORIGINS:
     allowed_origins.extend([origin.strip() for origin in settings.CORS_ORIGINS.split(",") if origin.strip()])
+
+import re
+
+def is_origin_allowed(origin: str) -> bool:
+    if not origin:
+        return False
+    if origin in allowed_origins:
+        return True
+    if re.match(r"^https://.*\.vercel\.app$", origin):
+        return True
+    return False
 
 app.add_middleware(
     CORSMiddleware,
@@ -110,20 +122,6 @@ except Exception as _spics_err:
 # Global Exception Handlers (Ensures CORS headers on errors)
 # ---------------------------------------------------------------------------
 
-@app.exception_handler(Exception)
-async def global_exception_handler(request: Request, exc: Exception):
-    logger.error(f"Unhandled exception: {exc}", exc_info=True)
-    response = JSONResponse(
-        status_code=500,
-        content={"detail": "Internal Server Error", "error": str(exc)},
-    )
-    # Manually add CORS headers since middleware might be bypassed on crash
-    origin = request.headers.get("origin")
-    if origin in allowed_origins:
-        response.headers["Access-Control-Allow-Origin"] = origin
-        response.headers["Access-Control-Allow-Credentials"] = "true"
-    return response
-
 @app.exception_handler(HTTPException)
 async def http_exception_handler(request: Request, exc: HTTPException):
     response = JSONResponse(
@@ -131,7 +129,7 @@ async def http_exception_handler(request: Request, exc: HTTPException):
         content={"detail": exc.detail},
     )
     origin = request.headers.get("origin")
-    if origin and origin in allowed_origins:
+    if origin and is_origin_allowed(origin):
         response.headers["Access-Control-Allow-Origin"] = origin
         response.headers["Access-Control-Allow-Credentials"] = "true"
     return response
@@ -144,7 +142,7 @@ async def global_exception_handler(request: Request, exc: Exception):
         content={"detail": "Internal Server Error", "error": str(exc)},
     )
     origin = request.headers.get("origin")
-    if origin and origin in allowed_origins:
+    if origin and is_origin_allowed(origin):
         response.headers["Access-Control-Allow-Origin"] = origin
         response.headers["Access-Control-Allow-Credentials"] = "true"
     return response

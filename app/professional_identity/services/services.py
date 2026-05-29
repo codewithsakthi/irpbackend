@@ -58,6 +58,12 @@ class ProfileService:
         await db.commit()
         await db.refresh(profile)
 
+    @staticmethod
+    async def _refresh_profile_completion(student_id: int, db: AsyncSession):
+        profile = await ProfileRepository(db).get_by_student_id(student_id)
+        if profile:
+            await ProfileService._refresh_completion(profile, student_id, db)
+
 
 class ProjectService:
     @staticmethod
@@ -101,13 +107,7 @@ class ProjectService:
                 detail="Cannot delete GitHub-imported projects. Remove the GitHub connection instead."
             )
         await repo.delete(project)
-        await ProjectService._refresh_profile_completion(student_id, db)
-
-    @staticmethod
-    async def _refresh_profile_completion(student_id: int, db: AsyncSession):
-        profile = await ProfileRepository(db).get_by_student_id(student_id)
-        if profile:
-            await ProfileService._refresh_completion(profile, student_id, db)
+        await ProfileService._refresh_profile_completion(student_id, db)
 
 
 class CertificationService:
@@ -119,7 +119,7 @@ class CertificationService:
     async def create(student_id: int, req: CertificationCreateRequest, db: AsyncSession):
         data = req.model_dump(exclude_unset=True)
         cert = await CertificationRepository(db).create(student_id, data)
-        await ProjectService._refresh_profile_completion(student_id, db)
+        await ProfileService._refresh_profile_completion(student_id, db)
         return cert
 
     @staticmethod
@@ -133,7 +133,7 @@ class CertificationService:
             from fastapi import HTTPException
             raise HTTPException(status_code=403, detail="Not your certification")
         updated = await repo.update(cert, req.model_dump(exclude_unset=True))
-        await ProjectService._refresh_profile_completion(student_id, db)
+        await ProfileService._refresh_profile_completion(student_id, db)
         return updated
 
     @staticmethod
@@ -158,7 +158,7 @@ class SkillService:
     async def create(student_id: int, req: SkillCreateRequest, db: AsyncSession):
         data = req.model_dump(exclude_unset=True)
         skill = await SkillRepository(db).create(student_id, data)
-        await ProjectService._refresh_profile_completion(student_id, db)
+        await ProfileService._refresh_profile_completion(student_id, db)
         return skill
 
     @staticmethod
