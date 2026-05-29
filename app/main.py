@@ -1,3 +1,9 @@
+import sys
+sys.modules['google._upb._message'] = None
+sys.modules['google.protobuf.pyext._message'] = None
+import os
+os.environ["PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION"] = "python"
+
 import logging
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware

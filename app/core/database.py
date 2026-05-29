@@ -42,6 +42,14 @@ class Settings(BaseSettings):
     OPENAI_ASR_BASE_URL: str = Field(default="https://api.openai.com/v1", env="OPENAI_ASR_BASE_URL")
     OPENAI_ASR_MODEL: str = Field(default="whisper-1", env="OPENAI_ASR_MODEL")
 
+    # ── RAG (Retrieval-Augmented Generation) settings ──────────────────────────
+    GEMINI_API_KEY: Optional[str] = Field(default=None, env="GEMINI_API_KEY")
+    OPENROUTER_API_KEY: Optional[str] = Field(default=None, env="OPENROUTER_API_KEY")
+    RAG_COLLECTION_NAME: str = Field(default="spark_rag", env="RAG_COLLECTION_NAME")
+    RAG_PERSIST_DIR: str = Field(default="./rag_data", env="RAG_PERSIST_DIR")
+    RAG_AUTO_INDEX: bool = Field(default=False, env="RAG_AUTO_INDEX")
+    RAG_TOP_K: int = Field(default=15, env="RAG_TOP_K")
+
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",
