@@ -38,6 +38,49 @@ from ..utils.utils import UPLOAD_BASE, get_picture_upload_dir
 profile_router = APIRouter(prefix="/profile", tags=["SPICS — Profile"])
 
 
+@profile_router.get("/linkedin-picture")
+async def get_linkedin_picture(
+    current_user: core_models.User = Depends(auth.get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Fetch and proxy the cached LinkedIn profile picture to avoid CORS and auth issues in the browser."""
+    _check_root_flag()
+    student_id = _get_student_id(current_user)
+    profile = await ProfileRepository(db).get_by_student_id(student_id)
+    if not profile or not profile.linkedin_cache_data:
+        raise HTTPException(status_code=404, detail="No LinkedIn profile linked or cached.")
+
+    # Parse JSON if stored as a string
+    cache = profile.linkedin_cache_data
+    if isinstance(cache, str):
+        try:
+            cache = json.loads(cache)
+        except Exception:
+            cache = {}
+
+    # Extract picture URL from cached LinkedIn data
+    pic_url = cache.get("picture") or cache.get("picture_url") or cache.get("profilePicture")
+    if not pic_url:
+        raise HTTPException(status_code=404, detail="No LinkedIn picture URL found in cached data.")
+
+    # Proxy the picture
+    async with httpx.AsyncClient() as client:
+        try:
+            resp = await client.get(pic_url, timeout=10.0)
+            if resp.status_code == 200:
+                return Response(
+                    content=resp.content,
+                    media_type=resp.headers.get("content-type", "image/jpeg"),
+                    headers={
+                        "Cache-Control": "public, max-age=86400",
+                    }
+                )
+        except Exception as e:
+            logger.warning(f"Failed to proxy LinkedIn picture from {pic_url}: {e}")
+
+    raise HTTPException(status_code=404, detail="Failed to fetch LinkedIn picture from remote URL.")
+
+
 @profile_router.get("/{student_id}", response_model=ProfileResponse)
 async def get_profile(
     student_id: int,
