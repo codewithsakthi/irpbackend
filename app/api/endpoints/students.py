@@ -2,7 +2,7 @@ from __future__ import annotations
 from typing import List, Optional
 import logging
 from fastapi import APIRouter, Depends, HTTPException, Query, Path, Request
-from sqlalchemy import select
+from sqlalchemy import select, func
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ...core import auth
