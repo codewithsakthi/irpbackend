@@ -260,7 +260,7 @@ async def get_subject_students(
     # Fetch students filtered by program, semester AND section
     query = select(models.Student).filter(
         models.Student.program_id == subject.program_id,
-        models.Student.current_semester.in_([subject.semester, subject.semester - 1])
+        models.Student.current_semester.in_([subject.semester - 1, subject.semester, subject.semester + 1])
     )
     if effective_section:
         query = query.filter(models.Student.section == effective_section)
@@ -325,15 +325,23 @@ async def get_subject_marks(
     
     effective_section = section or assignment.section
 
-    # Fetch students
+    # Fetch students (flexible semester matching)
     student_query = select(models.Student).filter(
         models.Student.program_id == subject.program_id,
-        models.Student.current_semester.in_([subject.semester, subject.semester - 1])
+        models.Student.current_semester.in_([subject.semester - 1, subject.semester, subject.semester + 1])
     )
     if effective_section:
         student_query = student_query.filter(models.Student.section == effective_section)
     
     students = (await db.execute(student_query)).scalars().all()
+
+    # Fallback to program + section if no students found
+    if not students:
+        fallback_query = select(models.Student).filter(models.Student.program_id == subject.program_id)
+        if effective_section:
+            fallback_query = fallback_query.filter(models.Student.section == effective_section)
+        students = (await db.execute(fallback_query)).scalars().all()
+
     student_ids = [s.id for s in students]
 
     if not student_ids:
