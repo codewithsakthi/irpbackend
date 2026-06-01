@@ -95,6 +95,9 @@ class ConnectionManager:
     async def broadcast_to_all_students(self, message: dict):
         await self._broadcast(self.students, message)
 
+    async def broadcast_to_all_staff(self, message: dict):
+        await self._broadcast(self.staff, message)
+
 
 manager = ConnectionManager()
 
@@ -254,3 +257,98 @@ async def notify_all_students(title: str, message: str):
             "timestamp": _now(),
         }
     )
+
+
+async def broadcast_achievement(title: str, message: str, meta: dict = None):
+    """Broadcast a celebratory achievement event to all online users (students, staff, admins)."""
+    payload = {
+        "type": "achievement",
+        "title": title,
+        "message": message,
+        "meta": meta or {},
+        "timestamp": _now(),
+    }
+    # Send to all admins
+    await manager.broadcast_to_admins(payload)
+    # Send to all staff
+    await manager.broadcast_to_all_staff(payload)
+    # Send to all students
+    await manager.broadcast_to_all_students(payload)
+
+
+async def send_user_push_notification(db: AsyncSession, user_id: int, title: str, message: str, url: str = "/"):
+    """
+    Sends a system-level background web push notification to a specific user
+    using their registered PWA Push subscriptions.
+    """
+    try:
+        from pywebpush import webpush, WebPushException
+        import os
+        import json
+        import asyncio
+
+        # 1. Query subscriptions
+        stmt = select(models.PushSubscription).where(models.PushSubscription.user_id == user_id)
+        res = await db.execute(stmt)
+        subscriptions = res.scalars().all()
+
+        if not subscriptions:
+            return
+
+        payload = {
+            "title": title,
+            "message": message,
+            "url": url
+        }
+
+        # 2. Get keys
+        try:
+            with open("vapid_keys.json", "r") as f:
+                keys = json.load(f)
+        except Exception:
+            print("[Push] Error: vapid_keys.json not found in backend.")
+            return
+
+        pem_path = "private_key.pem"
+        if not os.path.exists(pem_path):
+            with open(pem_path, "w") as f_pem:
+                f_pem.write(keys["private_key"])
+
+        # 3. Deliver in background for each sub
+        for sub in subscriptions:
+            sub_info = {
+                "endpoint": sub.endpoint,
+                "keys": {
+                    "p256dh": sub.p256dh,
+                    "auth": sub.auth
+                }
+            }
+
+            async def deliver():
+                try:
+                    loop = asyncio.get_running_loop()
+                    await loop.run_in_executor(
+                        None,
+                        lambda: webpush(
+                            subscription_info=sub_info,
+                            data=json.dumps(payload),
+                            vapid_private_key=pem_path,
+                            vapid_claims={"sub": "mailto:admin@spark.edu"},
+                        )
+                    )
+                    print(f"[Push] System push delivered successfully to user {user_id}")
+                except WebPushException as ex:
+                    # Clean up expired subscription
+                    if ex.response is not None and ex.response.status_code in {404, 410}:
+                        print(f"[Push] Subscription expired (status {ex.response.status_code}) for user {user_id}. Cleaning up.")
+                    else:
+                        print(f"[Push] Web Push delivery failed for user {user_id}: {ex}")
+                except Exception as ex:
+                    print(f"[Push] Error in deliver worker: {ex}")
+
+            asyncio.create_task(deliver())
+
+    except Exception as e:
+        print(f"[Push] Failed to dispatch user push: {e}")
+
+

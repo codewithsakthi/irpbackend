@@ -1728,3 +1728,253 @@ class CareerDistributionItem(BaseModel):
 
 class AdminCareerDistributionResponse(BaseModel):
     distribution: List[CareerDistributionItem]
+
+
+# Staff Professional Profile & Accomplishment Schemas
+class StaffQualificationBase(BaseModel):
+    degree: str
+    specialisation: Optional[str] = None
+    institution: Optional[str] = None
+    year_of_passing: Optional[int] = None
+    grade_or_percentage: Optional[str] = None
+
+class StaffQualificationCreate(StaffQualificationBase):
+    pass
+
+class StaffQualificationResponse(StaffQualificationBase):
+    id: int
+    staff_id: int
+    class Config:
+        from_attributes = True
+
+class StaffExperienceBase(BaseModel):
+    organisation: Optional[str] = None
+    role: Optional[str] = None
+    start_date: Optional[date] = None
+    end_date: Optional[date] = None
+    is_current: bool = False
+    experience_type: Optional[str] = None
+
+class StaffExperienceCreate(StaffExperienceBase):
+    pass
+
+class StaffExperienceResponse(StaffExperienceBase):
+    id: int
+    staff_id: int
+    class Config:
+        from_attributes = True
+
+class StaffCertificationBase(BaseModel):
+    certification_name: Optional[str] = None
+    issuing_body: Optional[str] = None
+    issue_date: Optional[date] = None
+    expiry_date: Optional[date] = None
+    credential_id: Optional[str] = None
+
+class StaffCertificationCreate(StaffCertificationBase):
+    pass
+
+class StaffCertificationResponse(StaffCertificationBase):
+    id: int
+    staff_id: int
+    class Config:
+        from_attributes = True
+
+class StaffPublicationBase(BaseModel):
+    title: str
+    publication_type: Optional[str] = None
+    journal_or_conf: Optional[str] = None
+    year: Optional[int] = None
+    doi_or_url: Optional[str] = None
+    is_indexed: bool = False
+
+class StaffPublicationCreate(StaffPublicationBase):
+    pass
+
+class StaffPublicationResponse(StaffPublicationBase):
+    id: int
+    staff_id: int
+    class Config:
+        from_attributes = True
+
+class StaffAchievementBase(BaseModel):
+    title: Optional[str] = None
+    category: Optional[str] = None
+    awarded_by: Optional[str] = None
+    year: Optional[int] = None
+    description: Optional[str] = None
+
+class StaffAchievementCreate(StaffAchievementBase):
+    pass
+
+
+class StaffAchievementResponse(StaffAchievementBase):
+    id: int
+    staff_id: int
+    class Config:
+        from_attributes = True
+
+class StaffProfessionalProfileBase(BaseModel):
+    designation: Optional[str] = None
+    years_of_experience: Optional[float] = None
+    date_of_joining: Optional[date] = None
+    employee_type: Optional[str] = None
+    specialisation: Optional[str] = None
+    google_scholar_url: Optional[str] = None
+    orcid_id: Optional[str] = None
+    bio: Optional[str] = None
+
+class StaffProfessionalProfileUpdate(StaffProfessionalProfileBase):
+    pass
+
+class StaffProfessionalProfileResponse(StaffProfessionalProfileBase):
+    staff_id: int
+    profile_photo_url: Optional[str] = None
+    updated_at: Optional[datetime] = None
+    class Config:
+        from_attributes = True
+
+class StaffFullProfileResponse(BaseModel):
+    profile: Optional[StaffProfessionalProfileResponse] = None
+    qualifications: List[StaffQualificationResponse] = []
+    experiences: List[StaffExperienceResponse] = []
+    certifications: List[StaffCertificationResponse] = []
+    publications: List[StaffPublicationResponse] = []
+    achievements: List[StaffAchievementResponse] = []
+
+
+# ─── Syllabus Tracking ────────────────────────────────────────────────────────
+
+class SyllabusPlanCreate(BaseModel):
+    """Staff/admin creates syllabus units for a subject."""
+    subject_id: int
+    academic_year: str
+    section: Optional[str] = None
+    unit_number: int = Field(ge=1, le=20)
+    unit_title: str = Field(min_length=2, max_length=255)
+    total_periods: int = Field(ge=0, le=500)
+
+
+class SyllabusPlanResponse(BaseModel):
+    """Single unit plan with computed progress."""
+    id: int
+    subject_id: int
+    subject_name: str
+    course_code: str
+    faculty_id: int
+    faculty_name: str
+    academic_year: str
+    section: Optional[str] = None
+    unit_number: int
+    unit_title: str
+    total_periods: int
+    covered_periods: int = 0
+    remaining_periods: int = 0
+    completion_percentage: float = 0.0
+    notes: Optional[str] = None
+    last_updated: Optional[datetime] = None
+
+    class Config:
+        from_attributes = True
+
+
+class SyllabusProgressUpdate(BaseModel):
+    """Staff updates how many periods they've covered for a unit."""
+    covered_periods: int = Field(ge=0, le=500)
+    notes: Optional[str] = Field(None, max_length=1000)
+
+
+class SyllabusSubjectSummary(BaseModel):
+    """Per-subject rollup for a faculty member."""
+    subject_id: int
+    subject_name: str
+    course_code: str
+    semester: Optional[int] = None
+    section: Optional[str] = None
+    total_units: int = 0
+    completed_units: int = 0
+    total_planned_periods: int = 0
+    total_covered_periods: int = 0
+    overall_completion_percentage: float = 0.0
+    units: List[SyllabusPlanResponse] = Field(default_factory=list)
+
+
+class SyllabusStaffOverview(BaseModel):
+    """HOD view — one card per staff member with their overall coverage."""
+    staff_id: int
+    staff_name: str
+    department: Optional[str] = None
+    total_subjects: int = 0
+    total_units: int = 0
+    total_planned_periods: int = 0
+    total_covered_periods: int = 0
+    overall_completion_percentage: float = 0.0
+    subjects: List[SyllabusSubjectSummary] = Field(default_factory=list)
+
+
+class SyllabusHODOverviewResponse(BaseModel):
+    """Full HOD dashboard response — all staff with syllabus coverage data."""
+    academic_year: str
+    total_staff: int = 0
+    department_completion_percentage: float = 0.0
+    staff_overviews: List[SyllabusStaffOverview] = Field(default_factory=list)
+
+
+class AchievementCreate(BaseModel):
+    title: str = Field(..., min_length=2, max_length=255)
+    description: Optional[str] = None
+    achievement_type: str = Field("achievement", max_length=50)
+    date_achieved: Optional[date] = None
+
+
+class AchievementResponse(BaseModel):
+    id: int
+    user_id: int
+    user_name: str
+    user_role: str
+    user_profile_photo: Optional[str] = None
+    title: str
+    description: Optional[str] = None
+    achievement_type: str
+    date_achieved: Optional[date] = None
+    attachment_url: Optional[str] = None
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class NotificationResponse(BaseModel):
+    id: int
+    recipient_id: int
+    title: str
+    content: str
+    channel: str
+    status: str
+    priority: str
+    sender_id: Optional[int] = None
+    created_at: datetime
+    read_at: Optional[datetime] = None
+
+    class Config:
+        from_attributes = True
+
+
+class PushSubscriptionKeys(BaseModel):
+    p256dh: str
+    auth: str
+
+
+class PushSubscriptionCreate(BaseModel):
+    endpoint: str
+    keys: PushSubscriptionKeys
+
+
+class PushSubscriptionResponse(BaseModel):
+    id: int
+    user_id: int
+    endpoint: str
+    created_at: datetime
+
+    class Config:
+        from_attributes = True

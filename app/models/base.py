@@ -547,3 +547,96 @@ class AcademicCalendar(Base):
         Index("idx_acad_cal_year_sem", "academic_year", "semester"),
         Index("idx_acad_cal_type_start", "event_type", "start_date"),
     )
+
+
+class SyllabusPlan(Base):
+    """
+    Defines the planned syllabus units for a faculty-subject assignment.
+    One row per unit per subject per faculty per academic year.
+    """
+    __tablename__ = "syllabus_plans"
+
+    id = Column(Integer, primary_key=True, index=True)
+    subject_id = Column(Integer, ForeignKey("subjects.id", ondelete="CASCADE"), nullable=False)
+    faculty_id = Column(Integer, ForeignKey("staff.id", ondelete="CASCADE"), nullable=False)
+    academic_year = Column(String(20), nullable=False)
+    section = Column(String(20), nullable=True)
+    unit_number = Column(Integer, nullable=False)
+    unit_title = Column(String(255), nullable=False)
+    total_periods = Column(Integer, nullable=False, default=0)
+    created_at = Column(TIMESTAMP, server_default=text("CURRENT_TIMESTAMP"))
+    updated_at = Column(TIMESTAMP, server_default=text("CURRENT_TIMESTAMP"), onupdate=text("CURRENT_TIMESTAMP"))
+
+    subject = relationship("Subject")
+    faculty = relationship("Staff")
+    progress = relationship("SyllabusProgress", back_populates="plan", uselist=False, cascade="all, delete-orphan")
+
+    __table_args__ = (
+        UniqueConstraint("subject_id", "faculty_id", "academic_year", "section", "unit_number",
+                         name="uq_syllabus_plan_unit"),
+        Index("idx_syllabus_plan_faculty", "faculty_id"),
+        Index("idx_syllabus_plan_subject", "subject_id"),
+        CheckConstraint("total_periods >= 0", name="chk_syllabus_total_periods"),
+    )
+
+
+class SyllabusProgress(Base):
+    """
+    Tracks actual periods covered for a syllabus plan unit.
+    Updated by the faculty member; viewed by HOD/admin.
+    """
+    __tablename__ = "syllabus_progress"
+
+    id = Column(Integer, primary_key=True, index=True)
+    plan_id = Column(Integer, ForeignKey("syllabus_plans.id", ondelete="CASCADE"), nullable=False, unique=True)
+    faculty_id = Column(Integer, ForeignKey("staff.id", ondelete="CASCADE"), nullable=False)
+    covered_periods = Column(Integer, nullable=False, default=0)
+    notes = Column(Text, nullable=True)
+    last_updated = Column(TIMESTAMP, server_default=text("CURRENT_TIMESTAMP"), onupdate=text("CURRENT_TIMESTAMP"))
+    updated_by = Column(Integer, ForeignKey("users.id"), nullable=True)
+
+    plan = relationship("SyllabusPlan", back_populates="progress")
+    faculty = relationship("Staff")
+    updater = relationship("User")
+
+    __table_args__ = (
+        CheckConstraint("covered_periods >= 0", name="chk_syllabus_covered_periods"),
+        Index("idx_syllabus_progress_faculty", "faculty_id"),
+    )
+
+
+class Achievement(Base):
+    """
+    User achievements, awards, certifications, or journal publications.
+    Logged by any user role (student, staff, admin) and broadcasted to everyone.
+    """
+    __tablename__ = "achievements"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    title = Column(String(255), nullable=False)
+    description = Column(Text, nullable=True)
+    achievement_type = Column(String(50), nullable=False, default="achievement") # achievement, journal, publication, award, certification
+    date_achieved = Column(Date, nullable=True)
+    attachment_url = Column(String(500), nullable=True)
+    created_at = Column(TIMESTAMP, server_default=func.now())
+
+    user = relationship("User")
+
+
+class PushSubscription(Base):
+    """
+    Stores PWA Web Push subscriptions for users to deliver native background push notifications.
+    """
+    __tablename__ = "push_subscriptions"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    endpoint = Column(Text, nullable=False, unique=True)
+    p256dh = Column(String(500), nullable=False)
+    auth = Column(String(500), nullable=False)
+    created_at = Column(TIMESTAMP, server_default=func.now())
+
+    user = relationship("User")
+
+

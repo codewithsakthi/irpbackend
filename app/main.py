@@ -14,7 +14,7 @@ from slowapi.errors import RateLimitExceeded
 from slowapi.middleware import SlowAPIMiddleware
 
 from .core.limiter import limiter  # must be imported before routers
-from .api.endpoints import auth, students, admin, staff, ai, websocket
+from .api.endpoints import auth, students, admin, staff, ai, websocket, syllabus, achievements
 from .core.database import engine, Base
 from .core.database import settings
 import sentry_sdk
@@ -102,6 +102,8 @@ app.include_router(students.router, prefix="/api/v1/students")
 app.include_router(admin.router, prefix="/api/v1/admin")
 app.include_router(staff.router, prefix="/api/v1/staff")
 app.include_router(ai.router, prefix="/api/v1/ai")
+app.include_router(syllabus.router, prefix="/api/v1/syllabus")
+app.include_router(achievements.router, prefix="/api/v1/achievements")
 app.include_router(websocket.router, prefix="/api/v1")
 
 # ── SPICS: Student Professional Identity & Capability System (isolated module) ──

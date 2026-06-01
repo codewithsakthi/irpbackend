@@ -646,11 +646,29 @@ async def submit_period_attendance(
         is_substitute=is_substitute,
     )
 
-    # ── Notify each student individually ─────────────────────────────────────
+    # ── Notify each student individually (WebSocket + Native Background OS Push) ──
     for student in students:
+        # 1. Send WebSocket notification
         await websocket.notify_student_attendance_updated(
             student.roll_no,
             f"Attendance marked for {subject.course_code}, Period {attendance_data.period} on {attendance_data.date}"
+        )
+
+        # 2. Retrieve student status for rich notification details
+        roll = student.roll_no.strip().upper()
+        status_label = "Present"
+        if roll in absentees_set:
+            status_label = "Absent"
+        elif roll in od_set:
+            status_label = "On Duty"
+
+        # 3. Dispatch native background Push notification (Windows, iOS, Android)
+        await websocket.send_user_push_notification(
+            db=db,
+            user_id=student.id,
+            title="Attendance Marked",
+            message=f"You were marked {status_label} for {subject.course_code} (Period {attendance_data.period}) on {attendance_data.date}.",
+            url="/?tab=Attendance"
         )
 
     return schemas.MessageResponse(message=f"Attendance submitted successfully{sub_note}")
@@ -782,3 +800,436 @@ async def get_today_summary(
 
     summary.sort(key=lambda x: x.period)
     return summary
+
+
+# --- Staff Professional Profile & CRUD Endpoints ---
+import os
+from pathlib import Path as pyPath
+from fastapi import UploadFile, File
+from fastapi.responses import FileResponse, RedirectResponse
+
+UPLOAD_BASE = pyPath(os.getenv("SPICS_UPLOAD_PATH", "./uploads"))
+STAFF_PICTURES_DIR = UPLOAD_BASE / "staff_pictures"
+
+
+@router.get(
+    "/me/profile",
+    response_model=schemas.StaffFullProfileResponse,
+    summary="Get Staff Professional Profile",
+    description="Retrieve the complete professional profile including qualifications, publications, etc. for the logged-in staff member."
+)
+async def get_my_profile(
+    db: AsyncSession = Depends(get_db),
+    current_user: models.User = Depends(auth.get_current_user)
+):
+    verify_staff_access(current_user)
+    
+    # 1. Fetch Profile
+    prof_res = await db.execute(select(models.StaffProfile).filter(models.StaffProfile.staff_id == current_user.id))
+    profile = prof_res.scalars().first()
+    
+    # 2. Fetch Qualifications
+    qual_res = await db.execute(select(models.StaffQualification).filter(models.StaffQualification.staff_id == current_user.id))
+    qualifications = qual_res.scalars().all()
+    
+    # 3. Fetch Experiences
+    exp_res = await db.execute(select(models.StaffExperience).filter(models.StaffExperience.staff_id == current_user.id))
+    experiences = exp_res.scalars().all()
+    
+    # 4. Fetch Certifications
+    cert_res = await db.execute(select(models.StaffCertification).filter(models.StaffCertification.staff_id == current_user.id))
+    certifications = cert_res.scalars().all()
+    
+    # 5. Fetch Publications
+    pub_res = await db.execute(select(models.StaffPublication).filter(models.StaffPublication.staff_id == current_user.id))
+    publications = pub_res.scalars().all()
+    
+    # 6. Fetch Achievements
+    ach_res = await db.execute(select(models.StaffAchievement).filter(models.StaffAchievement.staff_id == current_user.id))
+    achievements = ach_res.scalars().all()
+    
+    return schemas.StaffFullProfileResponse(
+        profile=profile,
+        qualifications=qualifications,
+        experiences=experiences,
+        certifications=certifications,
+        publications=publications,
+        achievements=achievements
+    )
+
+
+@router.put(
+    "/me/profile",
+    response_model=schemas.StaffProfessionalProfileResponse,
+    summary="Update Staff Professional Profile",
+    description="Upsert (create or update) the professional profile for the logged-in staff member."
+)
+async def update_my_profile(
+    profile_data: schemas.StaffProfessionalProfileUpdate = Body(...),
+    db: AsyncSession = Depends(get_db),
+    current_user: models.User = Depends(auth.get_current_user)
+):
+    verify_staff_access(current_user)
+    
+    prof_res = await db.execute(select(models.StaffProfile).filter(models.StaffProfile.staff_id == current_user.id))
+    profile = prof_res.scalars().first()
+    
+    data_dict = profile_data.model_dump(exclude_unset=True)
+    
+    if not profile:
+        profile = models.StaffProfile(staff_id=current_user.id, **data_dict)
+        db.add(profile)
+    else:
+        for key, val in data_dict.items():
+            setattr(profile, key, val)
+            
+    await db.commit()
+    await db.refresh(profile)
+    return profile
+
+
+@router.post(
+    "/me/profile/picture",
+    response_model=schemas.MessageResponse,
+    summary="Upload Staff Profile Picture",
+    description="Upload and set a custom profile photo for the logged-in staff member."
+)
+async def upload_staff_picture(
+    file: UploadFile = File(...),
+    db: AsyncSession = Depends(get_db),
+    current_user: models.User = Depends(auth.get_current_user)
+):
+    verify_staff_access(current_user)
+    
+    content = await file.read()
+    if len(content) > 5 * 1024 * 1024:
+        raise HTTPException(status_code=400, detail="Image size exceeds 5MB limit.")
+        
+    ext = pyPath(file.filename).suffix.lower() if file.filename else ".png"
+    if ext not in {".png", ".jpg", ".jpeg", ".gif", ".webp"}:
+        raise HTTPException(
+            status_code=400,
+            detail="Unsupported image format. Allowed formats: PNG, JPEG, GIF, WEBP."
+        )
+        
+    staff_dir = STAFF_PICTURES_DIR / str(current_user.id)
+    staff_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Clean existing profile picture files
+    for existing_file in staff_dir.glob("custom.*"):
+        try:
+            existing_file.unlink()
+        except Exception:
+            pass
+            
+    filename = f"custom{ext}"
+    dest_path = staff_dir / filename
+    dest_path.write_bytes(content)
+    
+    # Save relative URL or path
+    picture_rel_url = f"/api/v1/staff/profile/picture/{current_user.id}?t={int(datetime.utcnow().timestamp())}"
+    
+    prof_res = await db.execute(select(models.StaffProfile).filter(models.StaffProfile.staff_id == current_user.id))
+    profile = prof_res.scalars().first()
+    
+    if not profile:
+        profile = models.StaffProfile(staff_id=current_user.id, profile_photo_url=picture_rel_url)
+        db.add(profile)
+    else:
+        profile.profile_photo_url = picture_rel_url
+        
+    await db.commit()
+    return schemas.MessageResponse(message="Profile picture uploaded successfully")
+
+
+@router.get(
+    "/profile/picture/{staff_id}",
+    summary="Serve Staff Profile Picture",
+    description="Public route to serve a staff member's profile picture or return fallback avatar."
+)
+async def serve_staff_picture(
+    staff_id: int,
+    db: AsyncSession = Depends(get_db)
+):
+    prof_res = await db.execute(select(models.StaffProfile).filter(models.StaffProfile.staff_id == staff_id))
+    profile = prof_res.scalars().first()
+    
+    if profile and profile.profile_photo_url:
+        staff_dir = STAFF_PICTURES_DIR / str(staff_id)
+        # Search for custom.* in that folder
+        files = list(staff_dir.glob("custom.*"))
+        if files:
+            full_path = files[0].resolve()
+            # Prevent path traversal
+            uploads_root = UPLOAD_BASE.resolve()
+            if uploads_root not in full_path.parents and full_path != uploads_root:
+                raise HTTPException(status_code=400, detail="Invalid picture file path.")
+                
+            if full_path.exists() and full_path.is_file():
+                suffix = full_path.suffix.lower()
+                media_type = "image/png"
+                if suffix in {".jpg", ".jpeg"}:
+                    media_type = "image/jpeg"
+                elif suffix == ".gif":
+                    media_type = "image/gif"
+                elif suffix == ".webp":
+                    media_type = "image/webp"
+                return FileResponse(path=str(full_path), media_type=media_type)
+                
+    # Fallback default picture (redirect to a standard initials/placeholder UI)
+    staff_res = await db.execute(select(models.Staff).filter(models.Staff.id == staff_id))
+    staff = staff_res.scalars().first()
+    name = staff.name if staff else "Faculty"
+    encoded_name = name.replace(" ", "+")
+    return RedirectResponse(url=f"https://ui-avatars.com/api/?name={encoded_name}&background=6366f1&color=fff&size=128")
+
+
+# --- Qualifications CRUD ---
+@router.post("/me/qualifications", response_model=schemas.StaffQualificationResponse, status_code=201)
+async def create_my_qualification(
+    data: schemas.StaffQualificationCreate = Body(...),
+    db: AsyncSession = Depends(get_db),
+    current_user: models.User = Depends(auth.get_current_user)
+):
+    verify_staff_access(current_user)
+    qual = models.StaffQualification(staff_id=current_user.id, **data.model_dump())
+    db.add(qual)
+    await db.commit()
+    await db.refresh(qual)
+    return qual
+
+
+@router.put("/me/qualifications/{id}", response_model=schemas.StaffQualificationResponse)
+async def update_my_qualification(
+    id: int,
+    data: schemas.StaffQualificationCreate = Body(...),
+    db: AsyncSession = Depends(get_db),
+    current_user: models.User = Depends(auth.get_current_user)
+):
+    verify_staff_access(current_user)
+    res = await db.execute(select(models.StaffQualification).filter(models.StaffQualification.id == id, models.StaffQualification.staff_id == current_user.id))
+    qual = res.scalars().first()
+    if not qual:
+        raise HTTPException(status_code=404, detail="Qualification record not found or access denied")
+    for key, val in data.model_dump().items():
+        setattr(qual, key, val)
+    await db.commit()
+    await db.refresh(qual)
+    return qual
+
+
+@router.delete("/me/qualifications/{id}", response_model=schemas.MessageResponse)
+async def delete_my_qualification(
+    id: int,
+    db: AsyncSession = Depends(get_db),
+    current_user: models.User = Depends(auth.get_current_user)
+):
+    verify_staff_access(current_user)
+    res = await db.execute(select(models.StaffQualification).filter(models.StaffQualification.id == id, models.StaffQualification.staff_id == current_user.id))
+    qual = res.scalars().first()
+    if not qual:
+        raise HTTPException(status_code=404, detail="Qualification record not found or access denied")
+    await db.delete(qual)
+    await db.commit()
+    return schemas.MessageResponse(message="Qualification record deleted successfully")
+
+
+# --- Experience CRUD ---
+@router.post("/me/experiences", response_model=schemas.StaffExperienceResponse, status_code=201)
+async def create_my_experience(
+    data: schemas.StaffExperienceCreate = Body(...),
+    db: AsyncSession = Depends(get_db),
+    current_user: models.User = Depends(auth.get_current_user)
+):
+    verify_staff_access(current_user)
+    exp = models.StaffExperience(staff_id=current_user.id, **data.model_dump())
+    db.add(exp)
+    await db.commit()
+    await db.refresh(exp)
+    return exp
+
+
+@router.put("/me/experiences/{id}", response_model=schemas.StaffExperienceResponse)
+async def update_my_experience(
+    id: int,
+    data: schemas.StaffExperienceCreate = Body(...),
+    db: AsyncSession = Depends(get_db),
+    current_user: models.User = Depends(auth.get_current_user)
+):
+    verify_staff_access(current_user)
+    res = await db.execute(select(models.StaffExperience).filter(models.StaffExperience.id == id, models.StaffExperience.staff_id == current_user.id))
+    exp = res.scalars().first()
+    if not exp:
+        raise HTTPException(status_code=404, detail="Experience record not found or access denied")
+    for key, val in data.model_dump().items():
+        setattr(exp, key, val)
+    await db.commit()
+    await db.refresh(exp)
+    return exp
+
+
+@router.delete("/me/experiences/{id}", response_model=schemas.MessageResponse)
+async def delete_my_experience(
+    id: int,
+    db: AsyncSession = Depends(get_db),
+    current_user: models.User = Depends(auth.get_current_user)
+):
+    verify_staff_access(current_user)
+    res = await db.execute(select(models.StaffExperience).filter(models.StaffExperience.id == id, models.StaffExperience.staff_id == current_user.id))
+    exp = res.scalars().first()
+    if not exp:
+        raise HTTPException(status_code=404, detail="Experience record not found or access denied")
+    await db.delete(exp)
+    await db.commit()
+    return schemas.MessageResponse(message="Experience record deleted successfully")
+
+
+# --- Certifications CRUD ---
+@router.post("/me/certifications", response_model=schemas.StaffCertificationResponse, status_code=201)
+async def create_my_certification(
+    data: schemas.StaffCertificationCreate = Body(...),
+    db: AsyncSession = Depends(get_db),
+    current_user: models.User = Depends(auth.get_current_user)
+):
+    verify_staff_access(current_user)
+    cert = models.StaffCertification(staff_id=current_user.id, **data.model_dump())
+    db.add(cert)
+    await db.commit()
+    await db.refresh(cert)
+    return cert
+
+
+@router.put("/me/certifications/{id}", response_model=schemas.StaffCertificationResponse)
+async def update_my_certification(
+    id: int,
+    data: schemas.StaffCertificationCreate = Body(...),
+    db: AsyncSession = Depends(get_db),
+    current_user: models.User = Depends(auth.get_current_user)
+):
+    verify_staff_access(current_user)
+    res = await db.execute(select(models.StaffCertification).filter(models.StaffCertification.id == id, models.StaffCertification.staff_id == current_user.id))
+    cert = res.scalars().first()
+    if not cert:
+        raise HTTPException(status_code=404, detail="Certification record not found or access denied")
+    for key, val in data.model_dump().items():
+        setattr(cert, key, val)
+    await db.commit()
+    await db.refresh(cert)
+    return cert
+
+
+@router.delete("/me/certifications/{id}", response_model=schemas.MessageResponse)
+async def delete_my_certification(
+    id: int,
+    db: AsyncSession = Depends(get_db),
+    current_user: models.User = Depends(auth.get_current_user)
+):
+    verify_staff_access(current_user)
+    res = await db.execute(select(models.StaffCertification).filter(models.StaffCertification.id == id, models.StaffCertification.staff_id == current_user.id))
+    cert = res.scalars().first()
+    if not cert:
+        raise HTTPException(status_code=404, detail="Certification record not found or access denied")
+    await db.delete(cert)
+    await db.commit()
+    return schemas.MessageResponse(message="Certification record deleted successfully")
+
+
+# --- Publications CRUD ---
+@router.post("/me/publications", response_model=schemas.StaffPublicationResponse, status_code=201)
+async def create_my_publication(
+    data: schemas.StaffPublicationCreate = Body(...),
+    db: AsyncSession = Depends(get_db),
+    current_user: models.User = Depends(auth.get_current_user)
+):
+    verify_staff_access(current_user)
+    pub = models.StaffPublication(staff_id=current_user.id, **data.model_dump())
+    db.add(pub)
+    await db.commit()
+    await db.refresh(pub)
+    return pub
+
+
+@router.put("/me/publications/{id}", response_model=schemas.StaffPublicationResponse)
+async def update_my_publication(
+    id: int,
+    data: schemas.StaffPublicationCreate = Body(...),
+    db: AsyncSession = Depends(get_db),
+    current_user: models.User = Depends(auth.get_current_user)
+):
+    verify_staff_access(current_user)
+    res = await db.execute(select(models.StaffPublication).filter(models.StaffPublication.id == id, models.StaffPublication.staff_id == current_user.id))
+    pub = res.scalars().first()
+    if not pub:
+        raise HTTPException(status_code=404, detail="Publication record not found or access denied")
+    for key, val in data.model_dump().items():
+        setattr(pub, key, val)
+    await db.commit()
+    await db.refresh(pub)
+    return pub
+
+
+@router.delete("/me/publications/{id}", response_model=schemas.MessageResponse)
+async def delete_my_publication(
+    id: int,
+    db: AsyncSession = Depends(get_db),
+    current_user: models.User = Depends(auth.get_current_user)
+):
+    verify_staff_access(current_user)
+    res = await db.execute(select(models.StaffPublication).filter(models.StaffPublication.id == id, models.StaffPublication.staff_id == current_user.id))
+    pub = res.scalars().first()
+    if not pub:
+        raise HTTPException(status_code=404, detail="Publication record not found or access denied")
+    await db.delete(pub)
+    await db.commit()
+    return schemas.MessageResponse(message="Publication record deleted successfully")
+
+
+# --- Achievements CRUD ---
+@router.post("/me/achievements", response_model=schemas.StaffAchievementResponse, status_code=201)
+async def create_my_achievement(
+    data: schemas.StaffAchievementCreate = Body(...),
+    db: AsyncSession = Depends(get_db),
+    current_user: models.User = Depends(auth.get_current_user)
+):
+    verify_staff_access(current_user)
+    ach = models.StaffAchievement(staff_id=current_user.id, **data.model_dump())
+    db.add(ach)
+    await db.commit()
+    await db.refresh(ach)
+    return ach
+
+
+@router.put("/me/achievements/{id}", response_model=schemas.StaffAchievementResponse)
+async def update_my_achievement(
+    id: int,
+    data: schemas.StaffAchievementCreate = Body(...),
+    db: AsyncSession = Depends(get_db),
+    current_user: models.User = Depends(auth.get_current_user)
+):
+    verify_staff_access(current_user)
+    res = await db.execute(select(models.StaffAchievement).filter(models.StaffAchievement.id == id, models.StaffAchievement.staff_id == current_user.id))
+    ach = res.scalars().first()
+    if not ach:
+        raise HTTPException(status_code=404, detail="Achievement record not found or access denied")
+    for key, val in data.model_dump().items():
+        setattr(ach, key, val)
+    await db.commit()
+    await db.refresh(ach)
+    return ach
+
+
+@router.delete("/me/achievements/{id}", response_model=schemas.MessageResponse)
+async def delete_my_achievement(
+    id: int,
+    db: AsyncSession = Depends(get_db),
+    current_user: models.User = Depends(auth.get_current_user)
+):
+    verify_staff_access(current_user)
+    res = await db.execute(select(models.StaffAchievement).filter(models.StaffAchievement.id == id, models.StaffAchievement.staff_id == current_user.id))
+    ach = res.scalars().first()
+    if not ach:
+        raise HTTPException(status_code=404, detail="Achievement record not found or access denied")
+    await db.delete(ach)
+    await db.commit()
+    return schemas.MessageResponse(message="Achievement record deleted successfully")
+

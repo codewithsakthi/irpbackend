@@ -427,6 +427,54 @@ async def _transcribe_with_openai(audio_bytes: bytes) -> str:
     finally:
         await client.close()
 
+
+async def _transcribe_with_gemini(audio_bytes: bytes) -> str:
+    import base64
+    import os
+    api_key = settings.GEMINI_API_KEY or os.getenv("GEMINI_API_KEY")
+    if not api_key:
+        raise AsrUnavailableError("Fallback ASR provider is not configured.", source="gemini")
+
+    model = "gemini-3-flash-preview"
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+
+    headers = {
+        "x-goog-api-key": api_key,
+        "Content-Type": "application/json"
+    }
+
+    base64_audio = base64.b64encode(audio_bytes).decode("utf-8")
+
+    data = {
+        "contents": [
+            {
+                "parts": [
+                    {
+                        "inlineData": {
+                            "mimeType": "audio/webm",
+                            "data": base64_audio
+                        }
+                    },
+                    {
+                        "text": "Transcribe the audio exactly. Output only the transcription, with no other text, commentary, or explanation."
+                    }
+                ]
+            }
+        ]
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            response = await client.post(url, headers=headers, json=data)
+            response.raise_for_status()
+            result = response.json()
+            text = result["candidates"][0]["content"]["parts"][0]["text"]
+            return text.strip()
+    except Exception as e:
+        logger.error(f"Gemini transcription failed: {e}")
+        raise AsrUnavailableError(f"Fallback ASR provider unavailable: {e}", source="gemini") from e
+
+
 def _convert_to_pcm(audio_bytes: bytes) -> bytes:
     if av is None:
         raise AsrUnavailableError(
@@ -477,6 +525,7 @@ def _convert_to_pcm(audio_bytes: bytes) -> bytes:
         logger.error(f"Audio conversion with 'av' failed: {e}", exc_info=True)
         raise
 
+
 async def transcribe_attendance_audio(audio_bytes: bytes) -> str:
     """
     Transcribes audio using NVIDIA Riva ASR.
@@ -486,10 +535,14 @@ async def transcribe_attendance_audio(audio_bytes: bytes) -> str:
     try:
         logger.info(f"Starting ASR transcription: {len(audio_bytes)} bytes received.")
 
-        # If PyAV is unavailable, skip Riva path and use OpenAI fallback directly.
+        # If PyAV is unavailable, skip Riva path and use fallback directly.
         if av is None:
-            logger.warning("PyAV not installed; routing ASR directly to fallback provider.")
-            return await _transcribe_with_openai(audio_bytes)
+            logger.warning("PyAV not installed; routing ASR directly to fallback providers.")
+            try:
+                return await _transcribe_with_openai(audio_bytes)
+            except AsrUnavailableError as openai_error:
+                logger.warning(f"OpenAI fallback unavailable: {openai_error}. Trying Gemini.")
+                return await _transcribe_with_gemini(audio_bytes)
         
         # 1. Convert to Mono PCM 16kHz
         try:
@@ -508,9 +561,15 @@ async def transcribe_attendance_audio(audio_bytes: bytes) -> str:
             return transcript
         except AsrUnavailableError as primary_error:
             logger.warning(f"Primary ASR unavailable ({primary_error.source}): {primary_error}")
-            fallback_text = await _transcribe_with_openai(audio_bytes)
-            logger.info("Fallback ASR transcription successful.")
-            return fallback_text
+            try:
+                fallback_text = await _transcribe_with_openai(audio_bytes)
+                logger.info("Fallback ASR transcription successful (OpenAI).")
+                return fallback_text
+            except AsrUnavailableError as openai_error:
+                logger.warning(f"OpenAI fallback unavailable: {openai_error}. Trying Gemini.")
+                fallback_text = await _transcribe_with_gemini(audio_bytes)
+                logger.info("Fallback ASR transcription successful (Gemini).")
+                return fallback_text
         except AsrServiceError:
             raise
 
@@ -572,6 +631,33 @@ def _build_roster_index(roster: list[str]) -> list[dict]:
     return items
 
 
+def _levenshtein_distance(s1: str, s2: str) -> int:
+    if len(s1) < len(s2):
+        return _levenshtein_distance(s2, s1)
+    if len(s2) == 0:
+        return len(s1)
+
+    previous_row = range(len(s2) + 1)
+    for i, c1 in enumerate(s1):
+        current_row = [i + 1]
+        for j, c2 in enumerate(s2):
+            insertions = previous_row[j + 1] + 1
+            deletions = current_row[j] + 1
+            substitutions = previous_row[j] + (c1 != c2)
+            current_row.append(min(insertions, deletions, substitutions))
+        previous_row = current_row
+
+    return previous_row[-1]
+
+
+def _fuzzy_similarity(s1: str, s2: str) -> float:
+    if not s1 or not s2:
+        return 0.0
+    dist = _levenshtein_distance(s1, s2)
+    max_len = max(len(s1), len(s2))
+    return 1.0 - (dist / max_len)
+
+
 def _resolve_roster_reference(raw_value: str, roster_index: list[dict]) -> str | None:
     candidate = str(raw_value or "").strip()
     if not candidate:
@@ -624,6 +710,33 @@ def _resolve_roster_reference(raw_value: str, roster_index: list[dict]) -> str |
             top_items = [it for score, it in name_candidates if score == top_score]
             if len(top_items) == 1:
                 return top_items[0]["roll"]
+
+        # 4) Fuzzy / phonetic token and string matching as a fallback for spelling/pronunciation errors
+        fuzzy_matches = []
+        cand_tokens = [t for t in candidate_norm.split() if len(t) > 2]
+        for item in roster_index:
+            name_norm = item["name_norm"]
+            if not name_norm:
+                continue
+            name_tokens = [t for t in name_norm.split() if len(t) > 2]
+            
+            best_token_sim = 0.0
+            for ct in cand_tokens:
+                for nt in name_tokens:
+                    sim = _fuzzy_similarity(ct, nt)
+                    if sim > best_token_sim:
+                        best_token_sim = sim
+            
+            whole_sim = _fuzzy_similarity(candidate_norm, name_norm)
+            match_score = max(best_token_sim, whole_sim)
+            
+            # Require at least 70% phonetic/spelling similarity
+            if match_score >= 0.70:
+                fuzzy_matches.append((match_score, item))
+                
+        if fuzzy_matches:
+            fuzzy_matches.sort(key=lambda x: x[0], reverse=True)
+            return fuzzy_matches[0][1]["roll"]
 
     return None
 
@@ -708,6 +821,14 @@ def _rule_based_attendance_parse(transcript: str) -> dict:
         else:
             od.extend(mentions)
 
+    # Default fallback: If no status keyword is found at all, treat the entire text as a list of absentees
+    status_keywords = ["absent", "on duty", "od", "present"]
+    has_keyword = any(kw in text.lower() for kw in status_keywords)
+    if not has_keyword:
+        mentions = _split_mentions(text)
+        if mentions:
+            absent.extend(mentions)
+
     def _dedupe(values: list[str]) -> list[str]:
         seen: set[str] = set()
         out: list[str] = []
@@ -736,7 +857,8 @@ Student Roster (Roll Numbers & Names):
 
 Task: Extract students who are "Absent" (A) and students who are "On Duty" (OD).
 Others are considered present. If a student is mentioned as "OD", do NOT mark them as "Absent".
-If roll numbers aren't clear, match names against the roster.
+If roll numbers aren't clear, match names against the roster. Since this transcript comes from speech-to-text, names may be misspelled or mispronounced phonetically (e.g., "Sreevatsa" vs "Srivathsa", "Hareesh" vs "Harish", "Jon" vs "John"). Be extremely smart and match names phonetically to the most likely student in the Roster when spelling mismatches occur.
+If a student name or roll number is called out in the transcript without any explicit status keyword (e.g. just "Karthik JR"), treat them as "Absent" (A) by default, as the faculty is calling out the names of students who are absent.
 Ignore filler words/pauses (uh, um, okay, and then, stop words) and focus only on actionable attendance mentions.
 
 Return ONLY a JSON object with this exact structure:
