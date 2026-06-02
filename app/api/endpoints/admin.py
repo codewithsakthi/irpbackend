@@ -2137,63 +2137,109 @@ async def get_talent_matrix(
 ):
     require_admin(current_user)
     
-    # Fetch all students eagerly loaded with assessments and subjects to avoid lazy load MissingGreenlet
+    # Fetch all non-deleted students (no expensive joinedload needed for this endpoint)
     students_res = await db.execute(
-        select(models.Student)
-        .options(
-            joinedload(models.Student.assessments).joinedload(models.StudentAssessment.subject)
+        select(models.Student).filter(models.Student.is_deleted == False)
+    )
+    students = students_res.scalars().all()
+    
+    student_ids = [s.id for s in students]
+    if not student_ids:
+        return schemas.AdminTalentMatrixResponse(items=[], quadrant_counts={
+            "Star Performer": 0, "Academic Pillar": 0, "Curriculum Specialist": 0,
+            "High Potential Leader": 0, "Balanced Core": 0, "Solid Contributor": 0,
+            "Hidden Talent": 0, "Growth Candidate": 0, "Needs Developmental Support": 0
+        })
+
+    # ── Batch-fetch 1: All capability scores in one query ──────────────────────
+    cap_scores_res = await db.execute(
+        select(models.StudentCapabilityScore).filter(
+            models.StudentCapabilityScore.student_id.in_(student_ids)
         )
     )
-    students = students_res.unique().scalars().all()
-    
-    # Batch-fetch SPICS professional identity data for all students
-    student_ids = [s.id for s in students]
-    spics_map = {}
-    if student_ids:
-        spics_rows = (await db.execute(text("""
-            SELECT 
-                spp.student_id,
-                ROUND(spp.profile_completion_score::numeric, 2) AS profile_completion_score,
-                spp.github_username,
-                (SELECT COUNT(*) FROM student_projects sp WHERE sp.student_id = spp.student_id) AS projects_count,
-                (SELECT COUNT(*) FROM student_skills sk WHERE sk.student_id = spp.student_id) AS skills_count,
-                (SELECT COUNT(*) FROM student_certifications sc WHERE sc.student_id = spp.student_id) AS certs_count,
-                (SELECT ai.career_readiness_score FROM ai_professional_insights ai WHERE ai.student_id = spp.student_id) AS career_readiness_score
-            FROM student_professional_profiles spp
-            WHERE spp.student_id = ANY(:sids)
-        """), {"sids": student_ids})).mappings().all()
-        for row in spics_rows:
-            spics_map[row["student_id"]] = row
+    cap_scores_map: dict = {cs.student_id: cs for cs in cap_scores_res.scalars().all()}
 
+    # ── Batch-fetch 2: CGPA via single SQL aggregation (replaces 90x calculate_analytics) ──
+    cgpa_rows = (await db.execute(text("""
+        WITH grade_points AS (
+            SELECT
+                sa.student_id,
+                CASE sa.grade
+                    WHEN 'O'  THEN 10.0
+                    WHEN 'A+' THEN 9.0
+                    WHEN 'A'  THEN 8.0
+                    WHEN 'B+' THEN 7.0
+                    WHEN 'B'  THEN 6.0
+                    WHEN 'C'  THEN 5.0
+                    WHEN 'P'  THEN 4.0
+                    ELSE 0.0
+                END AS grade_point,
+                COALESCE(sub.credits, 3.0) AS credits
+            FROM student_assessments sa
+            JOIN subjects sub ON sub.id = sa.subject_id
+            WHERE sa.student_id = ANY(:sids)
+              AND sa.assessment_type = 'SEMESTER_EXAM'
+              AND sa.is_final = true
+              AND sa.grade IS NOT NULL
+              AND sub.is_active = true
+        )
+        SELECT
+            student_id,
+            CASE WHEN SUM(credits) > 0
+                THEN ROUND(SUM(grade_point * credits) / SUM(credits), 2)
+                ELSE 0.0
+            END AS cgpa
+        FROM grade_points
+        GROUP BY student_id
+    """), {"sids": student_ids})).mappings().all()
+    cgpa_map: dict = {row["student_id"]: float(row["cgpa"]) for row in cgpa_rows}
+
+    # ── Batch-fetch 3: SPICS professional identity data ────────────────────────
+    spics_map: dict = {}
+    spics_rows = (await db.execute(text("""
+        SELECT 
+            spp.student_id,
+            ROUND(spp.profile_completion_score::numeric, 2) AS profile_completion_score,
+            spp.github_username,
+            (SELECT COUNT(*) FROM student_projects sp WHERE sp.student_id = spp.student_id) AS projects_count,
+            (SELECT COUNT(*) FROM student_skills sk WHERE sk.student_id = spp.student_id) AS skills_count,
+            (SELECT COUNT(*) FROM student_certifications sc WHERE sc.student_id = spp.student_id) AS certs_count,
+            (SELECT ai.career_readiness_score FROM ai_professional_insights ai WHERE ai.student_id = spp.student_id) AS career_readiness_score
+        FROM student_professional_profiles spp
+        WHERE spp.student_id = ANY(:sids)
+    """), {"sids": student_ids})).mappings().all()
+    for row in spics_rows:
+        spics_map[row["student_id"]] = row
+
+    # ── Compute scores for any students missing cached capability scores ────────
+    missing_ids = [sid for sid in student_ids if sid not in cap_scores_map]
+    if missing_ids:
+        for sid in missing_ids:
+            try:
+                await StudentIntelligenceEngine.analyze_and_cache_student(sid, db, bypass_ai=True)
+                refreshed = await db.get(models.StudentCapabilityScore, sid)
+                if refreshed:
+                    cap_scores_map[sid] = refreshed
+            except Exception:
+                pass
+
+    # ── Build response ─────────────────────────────────────────────────────────
     items = []
     quadrant_counts = {
-        "Star Performer": 0,
-        "Academic Pillar": 0,
-        "Curriculum Specialist": 0,
-        "High Potential Leader": 0,
-        "Balanced Core": 0,
-        "Solid Contributor": 0,
-        "Hidden Talent": 0,
-        "Growth Candidate": 0,
-        "Needs Developmental Support": 0
+        "Star Performer": 0, "Academic Pillar": 0, "Curriculum Specialist": 0,
+        "High Potential Leader": 0, "Balanced Core": 0, "Solid Contributor": 0,
+        "Hidden Talent": 0, "Growth Candidate": 0, "Needs Developmental Support": 0
     }
     
     for student in students:
-        cap_score = await db.get(models.StudentCapabilityScore, student.id)
+        cap_score = cap_scores_map.get(student.id)
         if not cap_score:
-            # Generate deterministic scores on the fly and cache (bypassing slow AI for fast load)
-            dna = await StudentIntelligenceEngine.analyze_and_cache_student(student.id, db, bypass_ai=True)
-            academic = float(dna.capability_scores.academic_score)
-            spi = float(dna.spi_score)
-            profile_type = dna.profile_type
-        else:
-            academic = float(cap_score.academic_score)
-            spi = float(cap_score.spi_score)
-            profile_type = cap_score.profile_type or "Balanced Performer"
+            continue
             
-        # Fetch CGPA Proxy
-        analytics = await StudentService.calculate_analytics(student, db)
-        cgpa = float(analytics.average_grade_points)
+        academic = float(cap_score.academic_score or 0)
+        spi = float(cap_score.spi_score or 0)
+        profile_type = cap_score.profile_type or "Balanced Performer"
+        cgpa = cgpa_map.get(student.id, 0.0)
         
         # Classify into 9-box matrix quadrants
         if academic >= 80:
