@@ -113,7 +113,14 @@ class StudentService:
                 FROM subjects s
                 CROSS JOIN student_ctx st
                 WHERE (s.program_id = st.program_id OR s.program_id IS NULL)
-                  AND s.is_active = true  -- Only include active subjects
+                  AND (
+                      s.is_active = true
+                      OR EXISTS (
+                          SELECT 1
+                          FROM student_assessments sa
+                          WHERE sa.student_id = :sid AND sa.subject_id = s.id
+                      )
+                  )  -- Only include active subjects, or inactive subjects the student has taken
                   AND (
                       s.course_code NOT LIKE '24MCBC%'
                       OR EXISTS (
@@ -148,12 +155,28 @@ class StudentService:
                     MAX(a.marks) FILTER (WHERE a.assessment_type = 'CIT2') AS cit2,
                     MAX(a.marks) FILTER (WHERE a.assessment_type = 'CIT3') AS cit3,
                     MAX(a.marks) FILTER (WHERE a.assessment_type = 'SEMESTER_EXAM') AS sem_exam_marks,
-                    MAX(a.grade) FILTER (WHERE a.assessment_type = 'SEMESTER_EXAM' AND a.is_final = true) AS sem_grade,
-                    MAX(a.result_status) FILTER (WHERE a.assessment_type = 'SEMESTER_EXAM' AND a.is_final = true) AS sem_result_status,
+                    COALESCE(
+                        MAX(a.grade) FILTER (WHERE a.assessment_type = 'SEMESTER_EXAM' AND a.is_final = true),
+                        MAX(a.grade) FILTER (WHERE a.assessment_type = 'LAB' AND a.is_final = true),
+                        MAX(a.grade) FILTER (WHERE a.assessment_type = 'PROJECT' AND a.is_final = true)
+                    ) AS sem_grade,
+                    COALESCE(
+                        MAX(a.result_status) FILTER (WHERE a.assessment_type = 'SEMESTER_EXAM' AND a.is_final = true),
+                        MAX(a.result_status) FILTER (WHERE a.assessment_type = 'LAB' AND a.is_final = true),
+                        MAX(a.result_status) FILTER (WHERE a.assessment_type = 'PROJECT' AND a.is_final = true)
+                    ) AS sem_result_status,
                     MAX(a.marks) FILTER (WHERE a.assessment_type = 'LAB') AS lab,
                     MAX(a.marks) FILTER (WHERE a.assessment_type = 'PROJECT') AS project,
-                    MAX(a.attempt) FILTER (WHERE a.assessment_type = 'SEMESTER_EXAM') AS attempt,
-                    MAX(a.remarks) FILTER (WHERE a.assessment_type = 'SEMESTER_EXAM') AS remarks
+                    COALESCE(
+                        MAX(a.attempt) FILTER (WHERE a.assessment_type = 'SEMESTER_EXAM'),
+                        MAX(a.attempt) FILTER (WHERE a.assessment_type = 'LAB'),
+                        MAX(a.attempt) FILTER (WHERE a.assessment_type = 'PROJECT')
+                    ) AS attempt,
+                    COALESCE(
+                        MAX(a.remarks) FILTER (WHERE a.assessment_type = 'SEMESTER_EXAM'),
+                        MAX(a.remarks) FILTER (WHERE a.assessment_type = 'LAB'),
+                        MAX(a.remarks) FILTER (WHERE a.assessment_type = 'PROJECT')
+                    ) AS remarks
                 FROM student_assessments a
                 WHERE a.student_id = :sid
                 GROUP BY a.subject_id, a.semester
@@ -187,26 +210,12 @@ class StudentService:
                   )
                 GROUP BY sa.subject_id, sa.semester
             ),
-            -- Enhanced marks with computed total marks for each student
             marks_with_totals AS (
                 SELECT
                     mp.*,
-                    -- Compute total marks using existing grading logic
+                    -- Compute total marks using existing grading logic (exam mark directly)
                     CASE 
-                        WHEN mp.sem_exam_marks IS NOT NULL THEN 
-                            COALESCE(
-                                (CASE 
-                                    WHEN mp.cit1 IS NOT NULL AND mp.cit2 IS NOT NULL AND mp.cit3 IS NOT NULL THEN
-                                        (GREATEST(mp.cit1, mp.cit2) + GREATEST(mp.cit2, mp.cit3) + GREATEST(mp.cit1, mp.cit3) - LEAST(mp.cit1, mp.cit2, mp.cit3)) / 2.0
-                                    WHEN mp.cit1 IS NOT NULL AND mp.cit2 IS NOT NULL THEN (mp.cit1 + mp.cit2) / 2.0
-                                    WHEN mp.cit1 IS NOT NULL AND mp.cit3 IS NOT NULL THEN (mp.cit1 + mp.cit3) / 2.0
-                                    WHEN mp.cit2 IS NOT NULL AND mp.cit3 IS NOT NULL THEN (mp.cit2 + mp.cit3) / 2.0
-                                    WHEN mp.cit1 IS NOT NULL THEN mp.cit1
-                                    WHEN mp.cit2 IS NOT NULL THEN mp.cit2
-                                    WHEN mp.cit3 IS NOT NULL THEN mp.cit3
-                                    ELSE 0
-                                END), 0
-                            ) + mp.sem_exam_marks
+                        WHEN mp.sem_exam_marks IS NOT NULL THEN mp.sem_exam_marks
                         WHEN mp.lab IS NOT NULL THEN mp.lab
                         WHEN mp.project IS NOT NULL THEN mp.project
                         ELSE NULL
@@ -219,42 +228,10 @@ class StudentService:
                     sa.subject_id,
                     sa.semester,
                     sa.student_id,
-                    -- Compute total marks for all students in the subject
+                    -- Compute total marks for all students in the subject (exam mark directly)
                     CASE 
                         WHEN MAX(sa.marks) FILTER (WHERE sa.assessment_type = 'SEMESTER_EXAM') IS NOT NULL THEN
-                            COALESCE(
-                                (SELECT 
-                                    CASE 
-                                        WHEN c1.marks IS NOT NULL AND c2.marks IS NOT NULL AND c3.marks IS NOT NULL THEN
-                                            (GREATEST(c1.marks, c2.marks) + GREATEST(c2.marks, c3.marks) + GREATEST(c1.marks, c3.marks) - LEAST(c1.marks, c2.marks, c3.marks)) / 2.0
-                                        WHEN c1.marks IS NOT NULL AND c2.marks IS NOT NULL THEN (c1.marks + c2.marks) / 2.0
-                                        WHEN c1.marks IS NOT NULL AND c3.marks IS NOT NULL THEN (c1.marks + c3.marks) / 2.0  
-                                        WHEN c2.marks IS NOT NULL AND c3.marks IS NOT NULL THEN (c2.marks + c3.marks) / 2.0
-                                        WHEN c1.marks IS NOT NULL THEN c1.marks
-                                        WHEN c2.marks IS NOT NULL THEN c2.marks
-                                        WHEN c3.marks IS NOT NULL THEN c3.marks
-                                        ELSE 0
-                                    END
-                                 FROM (
-                                     SELECT 
-                                         MAX(marks) FILTER (WHERE assessment_type = 'CIT1') AS marks
-                                     FROM student_assessments 
-                                     WHERE student_id = sa.student_id AND subject_id = sa.subject_id AND semester = sa.semester
-                                 ) c1
-                                 CROSS JOIN (
-                                     SELECT 
-                                         MAX(marks) FILTER (WHERE assessment_type = 'CIT2') AS marks
-                                     FROM student_assessments 
-                                     WHERE student_id = sa.student_id AND subject_id = sa.subject_id AND semester = sa.semester
-                                 ) c2
-                                 CROSS JOIN (
-                                     SELECT 
-                                         MAX(marks) FILTER (WHERE assessment_type = 'CIT3') AS marks
-                                     FROM student_assessments 
-                                     WHERE student_id = sa.student_id AND subject_id = sa.subject_id AND semester = sa.semester
-                                 ) c3
-                                ), 0
-                            ) + MAX(sa.marks) FILTER (WHERE sa.assessment_type = 'SEMESTER_EXAM')
+                            MAX(sa.marks) FILTER (WHERE sa.assessment_type = 'SEMESTER_EXAM')
                         WHEN MAX(sa.marks) FILTER (WHERE sa.assessment_type = 'LAB') IS NOT NULL THEN 
                             MAX(sa.marks) FILTER (WHERE sa.assessment_type = 'LAB')
                         WHEN MAX(sa.marks) FILTER (WHERE sa.assessment_type = 'PROJECT') IS NOT NULL THEN 
@@ -292,7 +269,7 @@ class StudentService:
                 WHERE sct.student_total_marks IS NOT NULL
             )
             SELECT
-                sc.semester AS semester,
+                COALESCE(mwt.semester, sc.semester) AS semester,
                 sc.subject_id AS subject_id,
                 sc.course_code AS course_code,
                 sc.subject_name AS subject_name,
@@ -327,12 +304,11 @@ class StudentService:
             FROM subject_catalog sc
             LEFT JOIN marks_with_totals mwt
               ON mwt.subject_id = sc.subject_id
-             AND mwt.semester = sc.semester
             LEFT JOIN subject_percentiles sp
               ON sp.subject_id = sc.subject_id
-             AND sp.semester = sc.semester
+             AND sp.semester = COALESCE(mwt.semester, sc.semester)
              AND sp.student_id = :sid
-            ORDER BY sc.semester ASC, sc.course_code ASC
+            ORDER BY COALESCE(mwt.semester, sc.semester) ASC, sc.course_code ASC
             """
         )
 
@@ -383,19 +359,9 @@ class StudentService:
                     lab=float(row["lab"]) if row["lab"] is not None else None,
                     project=float(row["project"]) if row["project"] is not None else None,
                     internal_marks=computed.internal,
-                    # Semester Results should not be inferred from internals-only.
-                    # If there is no exam/lab/project component yet, keep final fields blank.
-                    total_marks=(
-                        computed.total
-                        if (
-                            is_audit
-                            or (sem_grade is not None and sem_exam_marks is not None)
-                            or (sem_grade is None and has_exam_component)
-                        )
-                        else None
-                    ),
-                    grade=(str(sem_grade) if sem_grade is not None else computed.grade) if (is_audit or has_exam_component) else None,
-                    result_status=(str(sem_result_status) if sem_result_status is not None else computed.result_status) if (is_audit or has_exam_component) else None,
+                    total_marks=computed.total if (is_audit or has_exam_component) else None,
+                    grade=computed.grade if computed.grade else (sem_grade if sem_grade else None),
+                    result_status=computed.result_status if computed.result_status else (sem_result_status if sem_result_status else None),
                     attempt=int(row["attempt"]) if row["attempt"] is not None else None,
                     remarks=str(row["remarks"]) if row["remarks"] is not None else None,
                     # Enhanced hybrid performance metrics
@@ -624,12 +590,24 @@ class StudentService:
         total_credits = 0.0
         for sub in graded_subjects:
             credits = CURRICULUM_CREDITS.get(sub['subject'].course_code, sub['subject'].credits or 0.0)
-            # Use grade point if available, else derive from marks
-            gp = getattr(sub, 'grade_point', None)
-            if gp is None and sub['EXAM'] is not None:
-                gp = (sub['EXAM'] / 10)
+            # Derive dynamically using correct exclusive grading rules
+            cits = sub.get('CIT', [])
+            cit1 = cits[0] if len(cits) > 0 else None
+            cit2 = cits[1] if len(cits) > 1 else None
+            cit3 = cits[2] if len(cits) > 2 else None
             
-            if gp is not None:
+            computed = compute_grade(
+                course_code=sub['subject'].course_code,
+                cit1=cit1,
+                cit2=cit2,
+                cit3=cit3,
+                semester_exam=sub['EXAM'],
+                lab=None,
+                project=None,
+            )
+            gp = computed.grade_point
+            
+            if gp is not None and credits > 0:
                 total_credit_points += float(credits) * float(gp)
                 total_credits += float(credits)
         
@@ -695,19 +673,31 @@ class StudentService:
             
             # Grade Points & Credits
             credits = CURRICULUM_CREDITS.get(data['subject'].course_code, data['subject'].credits or 0.0)
-            gp = grade_point_from_grade(data['grade'])
             
-            # Fallback to derivation from marks if grade is missing but exam marks are present
-            if gp is None and data['EXAM'] is not None:
-                gp = data['EXAM'] / 10.0
+            # Derive dynamically using correct exclusive grading rules
+            cits = data.get('CIT', [])
+            cit1 = cits[0] if len(cits) > 0 else None
+            cit2 = cits[1] if len(cits) > 1 else None
+            cit3 = cits[2] if len(cits) > 2 else None
+            
+            computed = compute_grade(
+                course_code=data['subject'].course_code,
+                cit1=cit1,
+                cit2=cit2,
+                cit3=cit3,
+                semester_exam=data['EXAM'],
+                lab=None,
+                project=None,
+            )
+            gp = computed.grade_point
             
             if gp is not None and credits > 0:
                 group["gp_sum"] += float(credits) * float(gp)
                 group["credits_sum"] += float(credits)
 
             # Backlogs
-            status = str(data['result_status'] or "").strip().upper()
-            grade = str(data['grade'] or "").strip().upper()
+            status = str(computed.result_status or "").strip().upper()
+            grade = str(computed.grade or "").strip().upper()
             if status in fail_statuses or grade in fail_grades:
                 group["backlogs"] += 1
 
@@ -716,7 +706,7 @@ class StudentService:
                 semester=s,
                 subject_count=data["count"],
                 average_internal=round(data["internal_sum"] / data["internal_count"], 2) if data["internal_count"] > 0 else 0.0,
-                average_grade_points=round(data["gp_sum"] / data["credits_sum"], 2) if data["credits_sum"] > 0 else 0.0,
+                average_grade_points=round(data["gp_sum"] / data["credits_sum"], 3) if data["credits_sum"] > 0 else None,
                 backlog_count=data["backlogs"]
             )
             for s, data in sorted(semester_perf_map.items())
@@ -1196,21 +1186,9 @@ class StudentService:
             marks_with_totals AS (
                 SELECT
                     mp.*,
+                    -- Compute total marks using existing grading logic (exam mark directly)
                     CASE 
-                        WHEN mp.sem_exam_marks IS NOT NULL THEN 
-                            COALESCE(
-                                (CASE 
-                                    WHEN mp.cit1 IS NOT NULL AND mp.cit2 IS NOT NULL AND mp.cit3 IS NOT NULL THEN
-                                        (GREATEST(mp.cit1, mp.cit2) + GREATEST(mp.cit2, mp.cit3) + GREATEST(mp.cit1, mp.cit3) - LEAST(mp.cit1, mp.cit2, mp.cit3)) / 2.0
-                                    WHEN mp.cit1 IS NOT NULL AND mp.cit2 IS NOT NULL THEN (mp.cit1 + mp.cit2) / 2.0
-                                    WHEN mp.cit1 IS NOT NULL AND mp.cit3 IS NOT NULL THEN (mp.cit1 + mp.cit3) / 2.0
-                                    WHEN mp.cit2 IS NOT NULL AND mp.cit3 IS NOT NULL THEN (mp.cit2 + mp.cit3) / 2.0
-                                    WHEN mp.cit1 IS NOT NULL THEN mp.cit1
-                                    WHEN mp.cit2 IS NOT NULL THEN mp.cit2
-                                    WHEN mp.cit3 IS NOT NULL THEN mp.cit3
-                                    ELSE 0
-                                END), 0
-                            ) + mp.sem_exam_marks
+                        WHEN mp.sem_exam_marks IS NOT NULL THEN mp.sem_exam_marks
                         WHEN mp.lab IS NOT NULL THEN mp.lab
                         WHEN mp.project IS NOT NULL THEN mp.project
                         ELSE NULL
@@ -1222,38 +1200,10 @@ class StudentService:
                     sa.subject_id,
                     sa.semester,
                     sa.student_id,
+                    -- Compute total marks for all students in the subject (exam mark directly)
                     CASE 
                         WHEN MAX(sa.marks) FILTER (WHERE sa.assessment_type = 'SEMESTER_EXAM') IS NOT NULL THEN
-                            COALESCE(
-                                (SELECT 
-                                    CASE 
-                                        WHEN c1.marks IS NOT NULL AND c2.marks IS NOT NULL AND c3.marks IS NOT NULL THEN
-                                            (GREATEST(c1.marks, c2.marks) + GREATEST(c2.marks, c3.marks) + GREATEST(c1.marks, c3.marks) - LEAST(c1.marks, c2.marks, c3.marks)) / 2.0
-                                        WHEN c1.marks IS NOT NULL AND c2.marks IS NOT NULL THEN (c1.marks + c2.marks) / 2.0
-                                        WHEN c1.marks IS NOT NULL AND c3.marks IS NOT NULL THEN (c1.marks + c3.marks) / 2.0  
-                                        WHEN c2.marks IS NOT NULL AND c3.marks IS NOT NULL THEN (c2.marks + c3.marks) / 2.0
-                                        WHEN c1.marks IS NOT NULL THEN c1.marks
-                                        WHEN c2.marks IS NOT NULL THEN c2.marks
-                                        WHEN c3.marks IS NOT NULL THEN c3.marks
-                                        ELSE 0
-                                    END
-                                 FROM (
-                                     SELECT MAX(marks) FILTER (WHERE assessment_type = 'CIT1') AS marks
-                                     FROM student_assessments 
-                                     WHERE student_id = sa.student_id AND subject_id = sa.subject_id AND semester = sa.semester
-                                 ) c1
-                                 CROSS JOIN (
-                                     SELECT MAX(marks) FILTER (WHERE assessment_type = 'CIT2') AS marks
-                                     FROM student_assessments 
-                                     WHERE student_id = sa.student_id AND subject_id = sa.subject_id AND semester = sa.semester
-                                 ) c2
-                                 CROSS JOIN (
-                                     SELECT MAX(marks) FILTER (WHERE assessment_type = 'CIT3') AS marks
-                                     FROM student_assessments 
-                                     WHERE student_id = sa.student_id AND subject_id = sa.subject_id AND semester = sa.semester
-                                 ) c3
-                                ), 0
-                            ) + MAX(sa.marks) FILTER (WHERE sa.assessment_type = 'SEMESTER_EXAM')
+                            MAX(sa.marks) FILTER (WHERE sa.assessment_type = 'SEMESTER_EXAM')
                         WHEN MAX(sa.marks) FILTER (WHERE sa.assessment_type = 'LAB') IS NOT NULL THEN 
                             MAX(sa.marks) FILTER (WHERE sa.assessment_type = 'LAB')
                         WHEN MAX(sa.marks) FILTER (WHERE sa.assessment_type = 'PROJECT') IS NOT NULL THEN 

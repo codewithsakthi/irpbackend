@@ -156,14 +156,7 @@ def _base_ctes(curriculum_credits: dict[str, float]) -> str:
     # total_marks_calculation_sql(), because that helper references SELECT aliases
     # (e.g. effective_internal_marks) which are not real columns in this query.
     exam_marks_expr = "COALESCE(mp.sem_exam, mp.lab_marks, mp.project_marks)"
-    raw_total_marks_expr = f"""
-    CASE
-        WHEN {exam_marks_expr} IS NULL AND ({internal_expr}) IS NULL THEN NULL
-        WHEN {exam_marks_expr} IS NULL THEN ({internal_expr})
-        WHEN sc.has_internal_component THEN COALESCE(({internal_expr}), 0) + COALESCE({exam_marks_expr}, 0)
-        ELSE COALESCE({exam_marks_expr}, 0)
-    END
-    """.strip()
+    raw_total_marks_expr = f"{exam_marks_expr}".strip()
 
     # Only treat a subject as "finalized" if an exam/lab/project mark exists OR a semester grade/result exists.
     # This prevents low CIT-only internals from being counted as failures/backlogs.
@@ -174,7 +167,16 @@ def _base_ctes(curriculum_credits: dict[str, float]) -> str:
     failed_expr = f"""
     CASE
         WHEN sc.course_code ILIKE '24AC%' THEN 0
-        WHEN NOT {final_component_expr} THEN 0
+        WHEN NOT {final_component_expr} THEN
+            CASE
+                WHEN sc.semester < st.current_semester 
+                     AND EXISTS (
+                         SELECT 1 FROM finalized_semesters fs 
+                         WHERE fs.batch = st.batch AND fs.semester = sc.semester
+                     )
+                THEN 1
+                ELSE 0
+            END
         WHEN upper(coalesce(mp.sem_result_status, '')) IN ('FAIL', 'F', 'ABSENT', 'AB') THEN 1
         WHEN upper(coalesce(mp.sem_grade, '')) IN ('U', 'F', 'FAIL', 'RA', 'AB', 'ABSENT', 'WH') THEN 1
         WHEN ({total_marks_expr}) < 50 AND ({total_marks_expr}) IS NOT NULL THEN 1
@@ -185,6 +187,12 @@ def _base_ctes(curriculum_credits: dict[str, float]) -> str:
     return f"""
     WITH curriculum_credits_map AS (
         SELECT * FROM (VALUES {credits_values}) AS t(course_code, credit)
+    ),
+    finalized_semesters AS (
+        SELECT DISTINCT st.batch, sa.semester
+        FROM student_assessments sa
+        JOIN students st ON st.id = sa.student_id
+        WHERE sa.assessment_type IN ('SEMESTER_EXAM', 'LAB', 'PROJECT')
     ),
     subject_catalog AS (
         SELECT
@@ -261,14 +269,14 @@ def _base_ctes(curriculum_credits: dict[str, float]) -> str:
             ({internal_expr}) AS effective_internal_marks,
             ({total_marks_expr}) AS total_marks,
             CASE
-                WHEN NULLIF(trim(coalesce(mp.sem_grade, '')), '') IS NOT NULL THEN mp.sem_grade
+                WHEN sc.course_code ILIKE '24AC%' THEN NULL
                 WHEN ({total_marks_expr}) IS NULL THEN NULL
-                WHEN ({total_marks_expr}) >= 90 THEN 'O'
-                WHEN ({total_marks_expr}) >= 80 THEN 'A+'
-                WHEN ({total_marks_expr}) >= 70 THEN 'A'
-                WHEN ({total_marks_expr}) >= 60 THEN 'B+'
-                WHEN ({total_marks_expr}) >= 50 THEN 'B'
-                WHEN ({total_marks_expr}) >= 45 THEN 'C'
+                WHEN ({total_marks_expr}) > 90 THEN 'O'
+                WHEN ({total_marks_expr}) > 80 THEN 'A+'
+                WHEN ({total_marks_expr}) > 70 THEN 'A'
+                WHEN ({total_marks_expr}) > 60 THEN 'B+'
+                WHEN ({total_marks_expr}) > 55 THEN 'B'
+                WHEN ({total_marks_expr}) >= 50 THEN 'C'
                 ELSE 'F'
             END AS grade,
             ({grade_point_expr}) AS grade_point,
@@ -323,7 +331,7 @@ def _base_ctes(curriculum_credits: dict[str, float]) -> str:
                     WHEN SUM(me.credit) FILTER (WHERE me.credit > 0) > 0
                     THEN (SUM(me.grade_point * me.credit) / SUM(me.credit) FILTER (WHERE me.credit > 0))
                     ELSE AVG(me.grade_point)
-                END::numeric, 2
+                END::numeric, 3
             ) AS cgpa
         FROM semester_gpa sg
         JOIN marks_enriched me ON me.student_id = sg.student_id AND me.semester = sg.semester

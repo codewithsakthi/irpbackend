@@ -51,12 +51,24 @@ class CurrentUser(User):
     program_name: Optional[str] = None
     program_code: Optional[str] = None
     rank: Optional[int] = None
+    phone_primary: Optional[str] = None
+    city: Optional[str] = None
+    address: Optional[str] = None
+    parent_guardian_name: Optional[str] = None
+    emergency_contact_phone: Optional[str] = None
+    parent_phone: Optional[str] = None
 
 
 class ProfileUpdate(BaseModel):
     name: str
     email: Optional[EmailStr] = None
     batch: Optional[str] = None
+    phone_primary: Optional[str] = None
+    city: Optional[str] = None
+    address: Optional[str] = None
+    parent_guardian_name: Optional[str] = None
+    emergency_contact_phone: Optional[str] = None
+    parent_phone: Optional[str] = None
 
 
 class PasswordChangeRequest(BaseModel):

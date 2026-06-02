@@ -20,6 +20,12 @@ class AdminService:
             WITH curriculum_credits_map AS (
                 SELECT * FROM (VALUES {credits_cte_values}) AS t(course_code, credit)
             ),
+            finalized_semesters AS (
+                SELECT DISTINCT st.batch, sa.semester
+                FROM student_assessments sa
+                JOIN students st ON st.id = sa.student_id
+                WHERE sa.assessment_type IN ('SEMESTER_EXAM', 'LAB', 'PROJECT')
+            ),
             marks_pivot AS (
                 SELECT
                     v.student_id,
@@ -41,8 +47,10 @@ class AdminService:
                 SELECT
                     mp.student_id,
                     st.roll_no,
+                    st.batch,
                     sb.course_code,
                     sb.semester,
+                    st.current_semester,
                     CASE 
                         WHEN sb.course_code LIKE '24AC%' THEN 0.0
                         ELSE COALESCE(NULLIF(sb.credits, 0), ccm.credit, 0)
@@ -51,6 +59,8 @@ class AdminService:
                     COALESCE(mp.sem_exam, mp.lab, mp.project) AS exam_component,
                     mp.sem_result_status,
                     mp.sem_grade,
+                    -- exam_marks: the exam/lab/project component ONLY, used for grade point calculation
+                    COALESCE(mp.sem_exam, mp.lab, mp.project) AS exam_marks,
                     CASE
                         WHEN sb.course_code LIKE '24AC%' AND mp.cit1 IS NULL AND mp.cit2 IS NULL AND mp.cit3 IS NULL AND mp.sem_exam IS NULL AND mp.lab IS NULL AND mp.project IS NULL
                         THEN NULL
@@ -77,7 +87,17 @@ class AdminService:
                         CASE
                             WHEN course_code NOT LIKE '24AC%'
                                 AND (
-                                    upper(coalesce(sem_result_status, '')) IN ('FAIL', 'F', 'ABSENT', 'AB')
+                                    (
+                                        (sem_grade IS NULL OR NULLIF(trim(sem_grade), '') IS NULL)
+                                        AND (sem_result_status IS NULL OR NULLIF(trim(sem_result_status), '') IS NULL)
+                                        AND exam_component IS NULL
+                                        AND semester < current_semester
+                                        AND EXISTS (
+                                            SELECT 1 FROM finalized_semesters fs
+                                            WHERE fs.batch = marks_scored.batch AND fs.semester = marks_scored.semester
+                                        )
+                                    )
+                                    OR upper(coalesce(sem_result_status, '')) IN ('FAIL', 'F', 'ABSENT', 'AB')
                                     OR upper(coalesce(sem_grade, '')) IN ('U', 'F', 'FAIL', 'RA', 'AB', 'ABSENT', 'WH')
                                 )
                             THEN 1
@@ -88,18 +108,18 @@ class AdminService:
                         CASE
                             WHEN SUM(credit) FILTER (
                                 WHERE credit > 0
-                                  AND ({grade_point_from_grade_or_marks_sql('sem_grade', 'total_marks').strip()}) IS NOT NULL
+                                  AND ({grade_point_from_grade_or_marks_sql('sem_grade', 'exam_marks').strip()}) IS NOT NULL
                             ) > 0 THEN
                                 SUM(
-                                    ({grade_point_from_grade_or_marks_sql('sem_grade', 'total_marks').strip()}) * credit
+                                    ({grade_point_from_grade_or_marks_sql('sem_grade', 'exam_marks').strip()}) * credit
                                 ) / SUM(credit) FILTER (
                                     WHERE credit > 0
-                                      AND ({grade_point_from_grade_or_marks_sql('sem_grade', 'total_marks').strip()}) IS NOT NULL
+                                      AND ({grade_point_from_grade_or_marks_sql('sem_grade', 'exam_marks').strip()}) IS NOT NULL
                                 )
                             ELSE AVG(
-                                ({grade_point_from_grade_or_marks_sql('sem_grade', 'total_marks').strip()})
+                                ({grade_point_from_grade_or_marks_sql('sem_grade', 'exam_marks').strip()})
                             ) FILTER (
-                                WHERE ({grade_point_from_grade_or_marks_sql('sem_grade', 'total_marks').strip()}) IS NOT NULL
+                                WHERE ({grade_point_from_grade_or_marks_sql('sem_grade', 'exam_marks').strip()}) IS NOT NULL
                                   AND course_code NOT LIKE '24AC%'
                             )
                         END
@@ -116,18 +136,18 @@ class AdminService:
                             CASE
                                 WHEN SUM(credit) FILTER (
                                     WHERE credit > 0
-                                      AND ({grade_point_from_grade_or_marks_sql('sem_grade', 'total_marks').strip()}) IS NOT NULL
+                                      AND ({grade_point_from_grade_or_marks_sql('sem_grade', 'exam_marks').strip()}) IS NOT NULL
                                 ) > 0 THEN
                                     SUM(
-                                        ({grade_point_from_grade_or_marks_sql('sem_grade', 'total_marks').strip()}) * credit
+                                        ({grade_point_from_grade_or_marks_sql('sem_grade', 'exam_marks').strip()}) * credit
                                     ) / SUM(credit) FILTER (
                                         WHERE credit > 0
-                                          AND ({grade_point_from_grade_or_marks_sql('sem_grade', 'total_marks').strip()}) IS NOT NULL
+                                          AND ({grade_point_from_grade_or_marks_sql('sem_grade', 'exam_marks').strip()}) IS NOT NULL
                                     )
                                 ELSE AVG(
-                                    ({grade_point_from_grade_or_marks_sql('sem_grade', 'total_marks').strip()})
+                                    ({grade_point_from_grade_or_marks_sql('sem_grade', 'exam_marks').strip()})
                                 ) FILTER (
-                                    WHERE ({grade_point_from_grade_or_marks_sql('sem_grade', 'total_marks').strip()}) IS NOT NULL
+                                    WHERE ({grade_point_from_grade_or_marks_sql('sem_grade', 'exam_marks').strip()}) IS NOT NULL
                                       AND course_code NOT LIKE '24AC%'
                                 )
                             END
@@ -141,6 +161,7 @@ class AdminService:
                     roll_no,
                     json_object_agg(semester, sgpa) AS semester_gpas
                 FROM semester_agg
+                WHERE sgpa IS NOT NULL
                 GROUP BY roll_no
             ),
             attendance_agg AS (
@@ -221,7 +242,7 @@ class AdminService:
         if batch:
             results = [item for item in results if (item.batch or '').lower() == batch.strip().lower()]
         if semester is not None:
-            results = [item for item in results if item.current_semester == semester]
+            results = [item for item in results if item.current_semester >= semester]
         if section:
             results = [item for item in results if (item.section or '').lower() == section.strip().lower()]
 
@@ -430,7 +451,7 @@ class AdminService:
             cohort_filters.append("s.batch = :batch")
             params["batch"] = batch.strip()
         if semester is not None:
-            cohort_filters.append("s.current_semester = :semester")
+            cohort_filters.append("s.current_semester >= :semester")
             params["semester"] = semester
         if section:
             cohort_filters.append("s.section = :section")
@@ -502,6 +523,12 @@ class AdminService:
             WITH curriculum_credits_map AS (
                 SELECT * FROM (VALUES {credits_cte_values}) AS t(course_code, credit)
             ),
+            finalized_semesters AS (
+                SELECT DISTINCT st.batch, sa.semester
+                FROM student_assessments sa
+                JOIN students st ON st.id = sa.student_id
+                WHERE sa.assessment_type IN ('SEMESTER_EXAM', 'LAB', 'PROJECT')
+            ),
             filtered_students AS (
                 SELECT s.* 
                 FROM students s
@@ -530,8 +557,10 @@ class AdminService:
                 SELECT
                     mp.student_id,
                     st.roll_no,
+                    st.batch,
                     sb.course_code,
                     sb.semester,
+                    st.current_semester,
                     CASE 
                         WHEN sb.course_code LIKE '24AC%' THEN 0.0
                         ELSE COALESCE(NULLIF(sb.credits, 0), ccm.credit, 0)
@@ -540,6 +569,8 @@ class AdminService:
                     COALESCE(mp.sem_exam, mp.lab, mp.project) AS exam_component,
                     mp.sem_result_status,
                     mp.sem_grade,
+                    -- exam_marks: the exam/lab/project component ONLY, used for grade point calculation
+                    COALESCE(mp.sem_exam, mp.lab, mp.project) AS exam_marks,
                     CASE
                         WHEN sb.course_code LIKE '24AC%' AND mp.cit1 IS NULL AND mp.cit2 IS NULL AND mp.cit3 IS NULL AND mp.sem_exam IS NULL AND mp.lab IS NULL AND mp.project IS NULL
                         THEN NULL
@@ -566,7 +597,17 @@ class AdminService:
                         CASE
                             WHEN course_code NOT LIKE '24AC%'
                                 AND (
-                                    upper(coalesce(sem_result_status, '')) IN ('FAIL', 'F', 'ABSENT', 'AB')
+                                    (
+                                        (sem_grade IS NULL OR NULLIF(trim(sem_grade), '') IS NULL)
+                                        AND (sem_result_status IS NULL OR NULLIF(trim(sem_result_status), '') IS NULL)
+                                        AND exam_component IS NULL
+                                        AND semester < current_semester
+                                        AND EXISTS (
+                                            SELECT 1 FROM finalized_semesters fs
+                                            WHERE fs.batch = marks_scored.batch AND fs.semester = marks_scored.semester
+                                        )
+                                    )
+                                    OR upper(coalesce(sem_result_status, '')) IN ('FAIL', 'F', 'ABSENT', 'AB')
                                     OR upper(coalesce(sem_grade, '')) IN ('U', 'F', 'FAIL', 'RA', 'AB', 'ABSENT', 'WH')
                                 )
                             THEN 1
@@ -577,18 +618,18 @@ class AdminService:
                         CASE
                             WHEN SUM(credit) FILTER (
                                 WHERE credit > 0
-                                  AND ({grade_point_from_grade_or_marks_sql('sem_grade', 'total_marks').strip()}) IS NOT NULL
+                                  AND ({grade_point_from_grade_or_marks_sql('sem_grade', 'exam_marks').strip()}) IS NOT NULL
                             ) > 0 THEN
                                 SUM(
-                                    ({grade_point_from_grade_or_marks_sql('sem_grade', 'total_marks').strip()}) * credit
+                                    ({grade_point_from_grade_or_marks_sql('sem_grade', 'exam_marks').strip()}) * credit
                                 ) / SUM(credit) FILTER (
                                     WHERE credit > 0
-                                      AND ({grade_point_from_grade_or_marks_sql('sem_grade', 'total_marks').strip()}) IS NOT NULL
+                                      AND ({grade_point_from_grade_or_marks_sql('sem_grade', 'exam_marks').strip()}) IS NOT NULL
                                 )
                             ELSE AVG(
-                                ({grade_point_from_grade_or_marks_sql('sem_grade', 'total_marks').strip()})
+                                ({grade_point_from_grade_or_marks_sql('sem_grade', 'exam_marks').strip()})
                             ) FILTER (
-                                WHERE ({grade_point_from_grade_or_marks_sql('sem_grade', 'total_marks').strip()}) IS NOT NULL
+                                WHERE ({grade_point_from_grade_or_marks_sql('sem_grade', 'exam_marks').strip()}) IS NOT NULL
                                   AND course_code NOT LIKE '24AC%'
                             )
                         END
@@ -605,18 +646,18 @@ class AdminService:
                             CASE
                                 WHEN SUM(credit) FILTER (
                                     WHERE credit > 0
-                                      AND ({grade_point_from_grade_or_marks_sql('sem_grade', 'total_marks').strip()}) IS NOT NULL
+                                      AND ({grade_point_from_grade_or_marks_sql('sem_grade', 'exam_marks').strip()}) IS NOT NULL
                                 ) > 0 THEN
                                     SUM(
-                                        ({grade_point_from_grade_or_marks_sql('sem_grade', 'total_marks').strip()}) * credit
+                                        ({grade_point_from_grade_or_marks_sql('sem_grade', 'exam_marks').strip()}) * credit
                                     ) / SUM(credit) FILTER (
                                         WHERE credit > 0
-                                          AND ({grade_point_from_grade_or_marks_sql('sem_grade', 'total_marks').strip()}) IS NOT NULL
+                                          AND ({grade_point_from_grade_or_marks_sql('sem_grade', 'exam_marks').strip()}) IS NOT NULL
                                     )
                                 ELSE AVG(
-                                    ({grade_point_from_grade_or_marks_sql('sem_grade', 'total_marks').strip()})
+                                    ({grade_point_from_grade_or_marks_sql('sem_grade', 'exam_marks').strip()})
                                 ) FILTER (
-                                    WHERE ({grade_point_from_grade_or_marks_sql('sem_grade', 'total_marks').strip()}) IS NOT NULL
+                                    WHERE ({grade_point_from_grade_or_marks_sql('sem_grade', 'exam_marks').strip()}) IS NOT NULL
                                       AND course_code NOT LIKE '24AC%'
                                 )
                             END
@@ -630,6 +671,7 @@ class AdminService:
                     roll_no,
                     json_object_agg(semester, sgpa) AS semester_gpas
                 FROM semester_agg
+                WHERE sgpa IS NOT NULL
                 GROUP BY roll_no
             ),
             attendance_agg AS (

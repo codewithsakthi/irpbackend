@@ -77,30 +77,17 @@ def best_2_of_3_cits_with_fallback_sql() -> str:
 
 def total_marks_calculation_sql(sg_internal_case: str) -> str:
     """
-    Returns SQL expression for calculating total marks using best 2 of 3 CITs.
-    
-    Args:
-        sg_internal_case: SQL expression that determines if internal marks should be included
-        
-    Returns:
-        SQL expression for total marks calculation
+    Returns SQL expression for calculating total marks.
+    The total mark is just the final exam, lab, or project mark directly.
     """
     return f"""
-    CASE
-        WHEN COALESCE(mp.sem_exam, mp.lab_marks, mp.project_marks) IS NULL
-             AND ({best_2_of_3_cits_null_check_sql()}) IS NULL
-        THEN NULL
-        WHEN {sg_internal_case}
-        THEN ({best_2_of_3_cits_with_fallback_sql()})
-             + COALESCE(COALESCE(mp.sem_exam, mp.lab_marks, mp.project_marks), 0)
-        ELSE COALESCE(COALESCE(mp.sem_exam, mp.lab_marks, mp.project_marks), 0)
-    END
+    COALESCE(mp.sem_exam, mp.lab_marks, mp.project_marks)
     """
 
 
 def grade_point_calculation_sql(sg_internal_case: str) -> str:
     """
-    Returns complete SQL CASE statement for grade point calculation using best 2 of 3 CITs.
+    Returns complete SQL CASE statement for grade point calculation.
 
     Args:
         sg_internal_case: SQL expression that determines if internal marks should be included
@@ -111,12 +98,12 @@ def grade_point_calculation_sql(sg_internal_case: str) -> str:
     total_marks_expr = total_marks_calculation_sql(sg_internal_case)
     return f"""
     CASE
-        WHEN ({total_marks_expr}) >= 90 THEN 10
-        WHEN ({total_marks_expr}) >= 80 THEN 9
-        WHEN ({total_marks_expr}) >= 70 THEN 8
-        WHEN ({total_marks_expr}) >= 60 THEN 7
-        WHEN ({total_marks_expr}) >= 50 THEN 6
-        WHEN ({total_marks_expr}) >= 45 THEN 5
+        WHEN ({total_marks_expr}) > 90 THEN 10
+        WHEN ({total_marks_expr}) > 80 THEN 9
+        WHEN ({total_marks_expr}) > 70 THEN 8
+        WHEN ({total_marks_expr}) > 60 THEN 7
+        WHEN ({total_marks_expr}) > 55 THEN 6
+        WHEN ({total_marks_expr}) >= 50 THEN 5
         ELSE 0
     END
     """
@@ -146,12 +133,12 @@ def grade_point_from_marks_sql(marks_expr: str) -> str:
     """SQL CASE: convert numeric marks expression -> grade points."""
     return f"""
     CASE
-        WHEN ({marks_expr}) >= 90 THEN 10
-        WHEN ({marks_expr}) >= 80 THEN 9
-        WHEN ({marks_expr}) >= 70 THEN 8
-        WHEN ({marks_expr}) >= 60 THEN 7
-        WHEN ({marks_expr}) >= 50 THEN 6
-        WHEN ({marks_expr}) >= 45 THEN 5
+        WHEN ({marks_expr}) > 90 THEN 10
+        WHEN ({marks_expr}) > 80 THEN 9
+        WHEN ({marks_expr}) > 70 THEN 8
+        WHEN ({marks_expr}) > 60 THEN 7
+        WHEN ({marks_expr}) > 55 THEN 6
+        WHEN ({marks_expr}) >= 50 THEN 5
         ELSE 0
     END
     """
@@ -159,15 +146,13 @@ def grade_point_from_marks_sql(marks_expr: str) -> str:
 
 def grade_point_from_grade_or_marks_sql(grade_expr: str, marks_expr: str) -> str:
     """
-    Prefer grade->points when a grade is present; otherwise fall back to marks thresholds.
+    Prefer dynamic marks thresholds to prevent using outdated database-stored grades.
 
-    Returns NULL only when both grade is blank and marks are NULL.
+    Returns NULL only when marks are NULL.
     """
-    grade_points_expr = grade_point_from_grade_sql(grade_expr).strip()
     marks_points_expr = grade_point_from_marks_sql(marks_expr).strip()
     return f"""
     CASE
-        WHEN NULLIF(trim(coalesce({grade_expr}, '')), '') IS NOT NULL THEN ({grade_points_expr})
         WHEN ({marks_expr}) IS NULL THEN NULL
         ELSE ({marks_points_expr})
     END

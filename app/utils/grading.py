@@ -70,25 +70,25 @@ def internal_best2_avg(cit1, cit2, cit3) -> Optional[float]:
 
 
 def total_marks(internal: Optional[float], exam: Optional[float]) -> Optional[float]:
-    if internal is None and exam is None:
-        return None
-    return float((internal or 0) + (exam or 0))
+    if exam is not None:
+        return float(exam)
+    return None
 
 
 def grade_from_total(total: Optional[float]) -> Optional[str]:
     if total is None:
         return None
-    if total >= 90:
+    if total > 90:
         return "O"
-    if total >= 80:
+    if total > 80:
         return "A+"
-    if total >= 70:
+    if total > 70:
         return "A"
-    if total >= 60:
+    if total > 60:
         return "B+"
-    if total >= 50:
+    if total > 55:
         return "B"
-    if total >= 45:
+    if total >= 50:
         return "C"
     return "F"
 
@@ -137,11 +137,19 @@ def compute_grade(
     if exam_component is None:
         exam_component = _to_float(lab) if _to_float(lab) is not None else _to_float(project)
 
-    # Remove automatic P grade assignment for audit courses
-    # All courses (including audit) now only get grades when assessments are taken
-    
     internal = internal_best2_avg(c1, c2, c3)
     total = total_marks(internal, exam_component)
+    
+    if is_audit:
+        return ComputedGrade(
+            internal=internal,
+            exam=exam_component,
+            total=total,
+            grade=None,
+            result_status="PASS" if (total and total >= 50) else "FAIL" if total is not None else None,
+            grade_point=total,
+        )
+
     grade = grade_from_total(total)
     return ComputedGrade(
         internal=internal,

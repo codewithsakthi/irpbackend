@@ -380,12 +380,12 @@ async def build_hod_dashboard(
                 ROUND(AVG(internal_max) FILTER (WHERE internal_max IS NOT NULL)::numeric, 2) AS average_internal_percentage,
                 ROUND(AVG(
                     CASE
-                        WHEN total_marks >= 90 THEN 10
-                        WHEN total_marks >= 80 THEN 9
-                        WHEN total_marks >= 70 THEN 8
-                        WHEN total_marks >= 60 THEN 7
-                        WHEN total_marks >= 50 THEN 6
-                        WHEN total_marks >= 45 THEN 5
+                        WHEN total_marks > 90 THEN 10
+                        WHEN total_marks > 80 THEN 9
+                        WHEN total_marks > 70 THEN 8
+                        WHEN total_marks > 60 THEN 7
+                        WHEN total_marks > 55 THEN 6
+                        WHEN total_marks >= 50 THEN 5
                         ELSE 0
                     END
                 ) FILTER (WHERE total_marks IS NOT NULL)::numeric, 2) AS average_grade_points,

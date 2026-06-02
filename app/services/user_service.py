@@ -22,6 +22,7 @@ class UserService:
         student = student_joined[0] if student_joined else None
         program = student_joined[2] if student_joined else None
         contact = student_joined[3] if student_joined else None
+        family = student_joined[4] if student_joined else None
         staff = None if student else await cls.get_staff_record(user, db)
         
         rank = None
@@ -51,7 +52,14 @@ class UserService:
             program_name=program.name if student and program else None,
             program_code=program.code if student and program else None,
             rank=rank,
+            phone_primary=student.phone_primary if student else None,
+            city=student.city if student else None,
+            address=student.address if student else None,
+            parent_guardian_name=family.parent_guardian_name if student and family else None,
+            emergency_contact_phone=family.emergency_contact_phone if student and family else None,
+            parent_phone=family.parent_phone if student and family else None,
         )
+
     @classmethod
     async def update_user_profile(cls, user: models.User, update_data: schemas.ProfileUpdate, db: AsyncSession) -> schemas.CurrentUser:
         # 1. Update basic user data (none currently in models.User, but we could add if needed)
@@ -66,6 +74,33 @@ class UserService:
                 student.email = update_data.email
             if update_data.batch:
                 student.batch = update_data.batch
+            if update_data.phone_primary is not None:
+                student.phone_primary = update_data.phone_primary
+            if update_data.city is not None:
+                student.city = update_data.city
+            if update_data.address is not None:
+                student.address = update_data.address
+                
+            # Update Family Details if applicable
+            family_res = await db.execute(select(models.FamilyDetail).filter(models.FamilyDetail.student_id == student.id))
+            family = family_res.scalars().first()
+            if family:
+                if update_data.parent_guardian_name is not None:
+                    family.parent_guardian_name = update_data.parent_guardian_name
+                if update_data.emergency_contact_phone is not None:
+                    family.emergency_contact_phone = update_data.emergency_contact_phone
+                if update_data.parent_phone is not None:
+                    family.parent_phone = update_data.parent_phone
+            else:
+                # If FamilyDetail record does not exist for this student, let's create it!
+                if update_data.parent_guardian_name is not None or update_data.emergency_contact_phone is not None or update_data.parent_phone is not None:
+                    family = models.FamilyDetail(
+                        student_id=student.id,
+                        parent_guardian_name=update_data.parent_guardian_name,
+                        emergency_contact_phone=update_data.emergency_contact_phone,
+                        parent_phone=update_data.parent_phone
+                    )
+                    db.add(family)
         else:
             # 3. Update Staff Profile if applicable
             result = await db.execute(select(models.Staff).filter(models.Staff.id == user.id))

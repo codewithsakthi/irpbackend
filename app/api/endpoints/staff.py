@@ -100,6 +100,15 @@ async def get_staff_dashboard(
             
         students_res = await db.execute(student_query)
         students = students_res.scalars().all()
+        
+        # Fallback to program + section if no students found in current semester range
+        if not students:
+            fallback_query = select(models.Student).filter(models.Student.program_id == subject.program_id)
+            if a.section:
+                fallback_query = fallback_query.filter(models.Student.section == a.section)
+            students_res = await db.execute(fallback_query)
+            students = students_res.scalars().all()
+            
         count = len(students)
         total_students += count
         
