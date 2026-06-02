@@ -2307,32 +2307,64 @@ async def get_hidden_talents(
     db: AsyncSession = Depends(get_db)
 ):
     require_admin(current_user)
-    
-    # Fetch all students eagerly loaded with assessments and subjects to avoid lazy load MissingGreenlet
+
     students_res = await db.execute(
-        select(models.Student)
-        .options(
-            joinedload(models.Student.assessments).joinedload(models.StudentAssessment.subject)
-        )
+        select(models.Student).filter(models.Student.is_deleted == False)
     )
-    students = students_res.unique().scalars().all()
-    
+    students = students_res.scalars().all()
+    student_ids = [s.id for s in students]
+    if not student_ids:
+        return schemas.AdminHiddenTalentsResponse(items=[])
+
+    # ── Batch-fetch capability scores ─────────────────────────────────────────
+    cap_rows = (await db.execute(
+        select(models.StudentCapabilityScore).filter(
+            models.StudentCapabilityScore.student_id.in_(student_ids)
+        )
+    )).scalars().all()
+    cap_map: dict = {cs.student_id: cs for cs in cap_rows}
+
+    # ── Batch-fetch CGPA for all students ─────────────────────────────────────
+    cgpa_rows = (await db.execute(text("""
+        WITH gp AS (
+            SELECT sa.student_id,
+                   CASE sa.grade
+                       WHEN 'O'  THEN 10.0 WHEN 'A+' THEN 9.0 WHEN 'A'  THEN 8.0
+                       WHEN 'B+' THEN 7.0  WHEN 'B'  THEN 6.0 WHEN 'C'  THEN 5.0
+                       WHEN 'P'  THEN 4.0  ELSE 0.0
+                   END AS grade_point,
+                   COALESCE(sub.credits, 3.0) AS credits
+            FROM student_assessments sa
+            JOIN subjects sub ON sub.id = sa.subject_id
+            WHERE sa.student_id = ANY(:sids)
+              AND sa.assessment_type = 'SEMESTER_EXAM'
+              AND sa.is_final = true AND sa.grade IS NOT NULL AND sub.is_active = true
+        )
+        SELECT student_id,
+               CASE WHEN SUM(credits) > 0
+                    THEN ROUND(SUM(grade_point * credits) / SUM(credits), 2)
+                    ELSE 0.0 END AS cgpa
+        FROM gp GROUP BY student_id
+    """), {"sids": student_ids})).mappings().all()
+    cgpa_map: dict = {r["student_id"]: float(r["cgpa"]) for r in cgpa_rows}
+
+    # ── Batch-fetch extra-curricular counts ───────────────────────────────────
+    ec_rows = (await db.execute(text("""
+        SELECT student_id, COUNT(*) AS ec_count
+        FROM extra_curricular
+        WHERE student_id = ANY(:sids)
+        GROUP BY student_id
+    """), {"sids": student_ids})).mappings().all()
+    ec_map: dict = {r["student_id"]: int(r["ec_count"]) for r in ec_rows}
+
     items = []
     for student in students:
-        cap_score = await db.get(models.StudentCapabilityScore, student.id)
+        cap_score = cap_map.get(student.id)
         if not cap_score:
-            # Generate deterministic scores
-            dna = await StudentIntelligenceEngine.analyze_and_cache_student(student.id, db, bypass_ai=True)
-            cap_dto = dna.capability_scores
-            profile_type = dna.profile_type
-        else:
-            cap_dto = schemas.StudentCapabilityScoreResponse.model_validate(cap_score)
-            profile_type = cap_score.profile_type or "Balanced Performer"
-            
-        analytics = await StudentService.calculate_analytics(student, db)
-        cgpa = float(analytics.average_grade_points)
-        
-        # Condition: lower CGPA but outstanding soft-skills/tech (score >= 75 in tech, leadership, sports, or creativity)
+            continue
+        cap_dto = schemas.StudentCapabilityScoreResponse.model_validate(cap_score)
+        cgpa = cgpa_map.get(student.id, 0.0)
+
         if cgpa < 7.0:
             outstanding = []
             if cap_dto.technical_score >= 75:
@@ -2343,13 +2375,8 @@ async def get_hidden_talents(
                 outstanding.append(f"Sports ({cap_dto.sports_score:.0f})")
             if cap_dto.creativity_score >= 75:
                 outstanding.append(f"Creativity ({cap_dto.creativity_score:.0f})")
-                
+
             if outstanding:
-                ec_count = await db.scalar(
-                    select(func.count(models.ExtraCurricular.activity_id))
-                    .filter(models.ExtraCurricular.student_id == student.id)
-                ) or 0
-                
                 reason = f"Lower academic proxy ({cgpa:.2f}) but shows exceptional strengths in: {', '.join(outstanding)}."
                 items.append(schemas.AdminHiddenTalentItem(
                     roll_no=student.roll_no,
@@ -2359,10 +2386,10 @@ async def get_hidden_talents(
                     leadership_score=float(cap_dto.leadership_score),
                     sports_score=float(cap_dto.sports_score),
                     creativity_score=float(cap_dto.creativity_score),
-                    extra_curricular_count=ec_count,
+                    extra_curricular_count=ec_map.get(student.id, 0),
                     highlight_reason=reason
                 ))
-                
+
     return schemas.AdminHiddenTalentsResponse(items=items)
 
 @router.get(
@@ -2395,34 +2422,74 @@ async def get_intervention_engine(
     db: AsyncSession = Depends(get_db)
 ):
     require_admin(current_user)
-    
-    # Fetch all students eagerly loaded with assessments and subjects to avoid lazy load MissingGreenlet
+
     students_res = await db.execute(
-        select(models.Student)
-        .options(
-            joinedload(models.Student.assessments).joinedload(models.StudentAssessment.subject)
-        )
+        select(models.Student).filter(models.Student.is_deleted == False)
     )
-    students = students_res.unique().scalars().all()
-    
+    students = students_res.scalars().all()
+    student_ids = [s.id for s in students]
+    if not student_ids:
+        return schemas.AdminInterventionResponse(items=[])
+
+    # ── Batch-fetch capability scores ─────────────────────────────────────────
+    cap_rows = (await db.execute(
+        select(models.StudentCapabilityScore).filter(
+            models.StudentCapabilityScore.student_id.in_(student_ids)
+        )
+    )).scalars().all()
+    cap_map: dict = {cs.student_id: cs for cs in cap_rows}
+
+    # ── Batch-fetch CGPA ──────────────────────────────────────────────────────
+    cgpa_rows = (await db.execute(text("""
+        WITH gp AS (
+            SELECT sa.student_id,
+                   CASE sa.grade
+                       WHEN 'O'  THEN 10.0 WHEN 'A+' THEN 9.0 WHEN 'A'  THEN 8.0
+                       WHEN 'B+' THEN 7.0  WHEN 'B'  THEN 6.0 WHEN 'C'  THEN 5.0
+                       WHEN 'P'  THEN 4.0  ELSE 0.0
+                   END AS grade_point,
+                   COALESCE(sub.credits, 3.0) AS credits
+            FROM student_assessments sa
+            JOIN subjects sub ON sub.id = sa.subject_id
+            WHERE sa.student_id = ANY(:sids)
+              AND sa.assessment_type = 'SEMESTER_EXAM'
+              AND sa.is_final = true AND sa.grade IS NOT NULL AND sub.is_active = true
+        )
+        SELECT student_id,
+               CASE WHEN SUM(credits) > 0
+                    THEN ROUND(SUM(grade_point * credits) / SUM(credits), 2)
+                    ELSE 0.0 END AS cgpa
+        FROM gp GROUP BY student_id
+    """), {"sids": student_ids})).mappings().all()
+    cgpa_map: dict = {r["student_id"]: float(r["cgpa"]) for r in cgpa_rows}
+
+    # ── Batch-fetch attendance percentage for all students ────────────────────
+    att_rows = (await db.execute(text("""
+        SELECT student_id,
+               CASE WHEN SUM(total_periods) > 0
+                    THEN ROUND(
+                        (SUM(present) + SUM(on_duty))::numeric
+                        / SUM(total_periods) * 100, 2
+                    )
+                    ELSE 0.0 END AS attendance_pct
+        FROM v_attendance_summary
+        WHERE student_id = ANY(:sids)
+        GROUP BY student_id
+    """), {"sids": student_ids})).mappings().all()
+    att_map: dict = {r["student_id"]: float(r["attendance_pct"]) for r in att_rows}
+
     items = []
     for student in students:
-        cap_score = await db.get(models.StudentCapabilityScore, student.id)
+        cap_score = cap_map.get(student.id)
         if not cap_score:
-            dna = await StudentIntelligenceEngine.analyze_and_cache_student(student.id, db, bypass_ai=True)
-            cap_dto = dna.capability_scores
-            profile_type = dna.profile_type
-        else:
-            cap_dto = schemas.StudentCapabilityScoreResponse.model_validate(cap_score)
-            profile_type = cap_score.profile_type or "Balanced Performer"
-            
-        analytics = await StudentService.calculate_analytics(student, db)
-        cgpa = float(analytics.average_grade_points)
-        attendance = float(analytics.attendance.percentage)
-        
+            continue
+        cap_dto = schemas.StudentCapabilityScoreResponse.model_validate(cap_score)
+        profile_type = cap_score.profile_type or "Balanced Performer"
+        cgpa = cgpa_map.get(student.id, 0.0)
+        attendance = att_map.get(student.id, 0.0)
+
         # Criteria: profile is Needs Support or Academic/Discipline score < 50
         if profile_type == "Needs Support" or cap_dto.academic_score < 50 or cap_dto.discipline_score < 50:
-            # Calculate Risk Level
             if cap_dto.academic_score < 40 or attendance < 65:
                 risk_level = "Critical"
                 action = "Initiate formal counseling diary meeting and draft an academic recovery plan."
@@ -2432,7 +2499,7 @@ async def get_intervention_engine(
             else:
                 risk_level = "Moderate"
                 action = "Monitor closely and request regular attendance reviews."
-                
+
             items.append(schemas.AdminInterventionItem(
                 roll_no=student.roll_no,
                 name=student.name,
@@ -2444,7 +2511,7 @@ async def get_intervention_engine(
                 suggested_action=action,
                 risk_level=risk_level
             ))
-            
+
     return schemas.AdminInterventionResponse(items=items)
 
 @router.get(
@@ -2476,30 +2543,26 @@ async def get_career_distribution(
                 domain_counts[top_domain] = domain_counts.get(top_domain, 0) + 1
                 total_fit_records += 1
                 
-    # Fallback to heuristics if AI profiles aren't populated yet
+    # Fallback to heuristics if AI profiles aren't populated yet — batch query
     if total_fit_records == 0:
-        students_res = await db.execute(select(models.Student))
-        students = students_res.scalars().all()
-        for student in students:
-            cap_score = await db.get(models.StudentCapabilityScore, student.id)
-            if cap_score:
-                tech = float(cap_score.technical_score)
-                lead = float(cap_score.leadership_score)
-                academic = float(cap_score.academic_score)
-                
-                # Simple heuristic choice
-                if tech >= 75:
-                    top_domain = "Software Engineering"
-                elif lead >= 70:
-                    top_domain = "Product Management"
-                elif academic >= 75:
-                    top_domain = "Research"
-                else:
-                    top_domain = "Operations"
-                    
-                domain_counts[top_domain] = domain_counts.get(top_domain, 0) + 1
-                total_fit_records += 1
-                
+        cap_rows = (await db.execute(
+            select(models.StudentCapabilityScore)
+        )).scalars().all()
+        for cap_score in cap_rows:
+            tech = float(cap_score.technical_score or 0)
+            lead = float(cap_score.leadership_score or 0)
+            academic = float(cap_score.academic_score or 0)
+            if tech >= 75:
+                top_domain = "Software Engineering"
+            elif lead >= 70:
+                top_domain = "Product Management"
+            elif academic >= 75:
+                top_domain = "Research"
+            else:
+                top_domain = "Operations"
+            domain_counts[top_domain] = domain_counts.get(top_domain, 0) + 1
+            total_fit_records += 1
+
     distribution = []
     for domain, count in domain_counts.items():
         percentage = (count / total_fit_records * 100.0) if total_fit_records > 0 else 0.0
@@ -2508,6 +2571,6 @@ async def get_career_distribution(
             count=count,
             percentage=round(percentage, 1)
         ))
-        
+
     distribution.sort(key=lambda x: x.count, reverse=True)
     return schemas.AdminCareerDistributionResponse(distribution=distribution)
