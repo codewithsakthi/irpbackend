@@ -1279,6 +1279,93 @@ async def get_student_record(
         db=db,
     )
     return await StudentService.build_full_student_record(student.roll_no, student_id=student.id, db=db)
+
+@router.post(
+    "/students",
+    response_model=schemas.AdminStudentCreateResponse,
+    summary="Create a new student",
+    description="Add a new student with login credentials. The initial password is set to the student's date of birth (DDMMYYYY format).",
+)
+async def create_student(
+    payload: schemas.AdminStudentCreate,
+    current_user: models.User = Depends(auth.get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Create a new student account.
+    - roll_no is used as the username
+    - Initial password is DOB formatted as DDMMYYYY
+    """
+    require_admin(current_user)
+
+    # Check roll_no uniqueness
+    existing_student = await db.execute(
+        select(models.Student).filter(models.Student.roll_no == payload.roll_no.upper())
+    )
+    if existing_student.scalars().first():
+        raise HTTPException(status_code=400, detail="A student with this roll number already exists")
+
+    username = payload.roll_no.lower()
+
+    # Check username uniqueness
+    existing_user = await db.execute(
+        select(models.User).filter(models.User.username == username)
+    )
+    if existing_user.scalars().first():
+        raise HTTPException(status_code=400, detail="Username derived from roll number already exists")
+
+    # Check reg_no uniqueness if provided
+    if payload.reg_no:
+        existing_reg = await db.execute(
+            select(models.Student).filter(models.Student.reg_no == payload.reg_no)
+        )
+        if existing_reg.scalars().first():
+            raise HTTPException(status_code=400, detail="A student with this registration number already exists")
+
+    # Resolve student role
+    role_res = await db.execute(select(models.Role).filter(models.Role.name == "student"))
+    student_role = role_res.scalars().first()
+    if not student_role:
+        raise HTTPException(status_code=500, detail="Student role not configured in database")
+
+    # Initial password: DOB as DDMMYYYY
+    initial_password = payload.dob.strftime("%d%m%Y")
+    hashed_pwd = auth.get_password_hash(initial_password)
+
+    user = models.User(
+        username=username,
+        password_hash=hashed_pwd,
+        role_id=student_role.id,
+        is_initial_password=True,
+    )
+    db.add(user)
+    await db.flush()
+
+    student = models.Student(
+        id=user.id,
+        roll_no=payload.roll_no.upper(),
+        reg_no=payload.reg_no,
+        name=payload.name,
+        dob=payload.dob,
+        email=payload.email,
+        batch=payload.batch,
+        section=payload.section,
+        current_semester=payload.current_semester,
+    )
+    db.add(student)
+    await db.commit()
+    await db.refresh(student)
+
+    return schemas.AdminStudentCreateResponse(
+        roll_no=student.roll_no,
+        name=student.name,
+        username=username,
+        initial_password=initial_password,
+        batch=student.batch,
+        current_semester=student.current_semester,
+        section=student.section,
+    )
+
 @router.post("/assign-sections", response_model=schemas.MessageResponse)
 async def assign_student_sections(
     batch: str = Query(..., description="Batch to process"),

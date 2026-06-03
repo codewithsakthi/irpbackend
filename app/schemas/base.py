@@ -1511,6 +1511,28 @@ class StaffSubjectAssign(BaseModel):
     subject_codes: List[str] = Field(default_factory=list, description="Subject codes to assign (alternative to IDs)")
 
 
+class AdminStudentCreate(BaseModel):
+    """Schema for admin to create a single student with login credentials."""
+    roll_no: str = Field(min_length=1, max_length=20)
+    name: str = Field(min_length=2, max_length=255)
+    dob: date = Field(description="Date of birth (used as initial password)")
+    email: Optional[EmailStr] = None
+    batch: Optional[str] = Field(None, max_length=20, description="Batch identifier e.g. '2023-2025'")
+    current_semester: Optional[int] = Field(None, ge=1, le=12)
+    reg_no: Optional[str] = Field(None, max_length=20)
+    section: Optional[str] = Field(None, max_length=10)
+
+
+class AdminStudentCreateResponse(BaseModel):
+    roll_no: str
+    name: str
+    username: str
+    initial_password: str
+    batch: Optional[str] = None
+    current_semester: Optional[int] = None
+    section: Optional[str] = None
+
+
 class StaffCreate(BaseModel):
     username: str = Field(min_length=3, max_length=50, pattern=r'^[a-zA-Z0-9_.-]+$')
     password: str = Field(min_length=6, description="Password must be at least 6 characters")
