@@ -1,6 +1,6 @@
 from enum import Enum
 from typing import Optional, List
-from fastapi import APIRouter, Depends, Query, Path, HTTPException, Response, Request
+from fastapi import APIRouter, Depends, Query, Path, HTTPException, Response, Request, UploadFile, File
 from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 from pydantic import Field
@@ -1365,6 +1365,219 @@ async def create_student(
         current_semester=student.current_semester,
         section=student.section,
     )
+
+
+@router.post(
+    "/students/import",
+    response_model=schemas.AdminStudentImportResponse,
+    summary="Bulk import students via CSV",
+    description="Import multiple students using a CSV file. Fields: roll_no, name, dob (YYYY-MM-DD, DD/MM/YYYY or DD-MM-YYYY), email, batch, reg_no, section, current_semester."
+)
+async def import_students(
+    file: UploadFile = File(...),
+    current_user: models.User = Depends(auth.get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    require_admin(current_user)
+    
+    import csv
+    import io
+    from datetime import datetime
+    
+    # Read the file content
+    contents = await file.read()
+    try:
+        csv_text = contents.decode("utf-8")
+    except UnicodeDecodeError:
+        try:
+            csv_text = contents.decode("latin-1")
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Could not decode file: {str(e)}")
+            
+    f = io.StringIO(csv_text)
+    reader = csv.DictReader(f)
+    
+    if not reader.fieldnames:
+        raise HTTPException(status_code=400, detail="CSV file is empty or has no headers")
+        
+    # Standardize fieldnames to lowercase and strip whitespace
+    headers = [h.strip().lower() for h in reader.fieldnames if h]
+    
+    # Check if we have semicolon separator
+    if len(headers) == 1 and ";" in reader.fieldnames[0]:
+        f.seek(0)
+        reader = csv.DictReader(f, delimiter=";")
+        headers = [h.strip().lower() for h in (reader.fieldnames or []) if h]
+        
+    required_fields = {"roll_no", "name", "dob"}
+    missing_fields = required_fields - set(headers)
+    if missing_fields:
+        raise HTTPException(
+            status_code=400,
+            detail=f"CSV is missing required headers: {', '.join(missing_fields)}. Found headers: {', '.join(reader.fieldnames or [])}"
+        )
+        
+    role_res = await db.execute(select(models.Role).filter(models.Role.name == "student"))
+    student_role = role_res.scalars().first()
+    if not student_role:
+        raise HTTPException(status_code=500, detail="Student role not configured in database")
+        
+    success_count = 0
+    failed_count = 0
+    errors = []
+    
+    # Helper to parse date
+    def parse_date(date_str: str):
+        date_str = date_str.strip()
+        for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%d-%m-%Y", "%Y/%m/%d"):
+            try:
+                return datetime.strptime(date_str, fmt).date()
+            except ValueError:
+                continue
+        raise ValueError(f"Invalid date format '{date_str}'. Supported formats: YYYY-MM-DD, DD/MM/YYYY, DD-MM-YYYY")
+
+    row_num = 1
+    for row in reader:
+        row_num += 1
+        
+        # Clean row: lower case keys, strip keys and values
+        clean_row = {k.strip().lower(): (v.strip() if v else "") for k, v in row.items() if k}
+        
+        roll_no = clean_row.get("roll_no", "").strip().upper()
+        name = clean_row.get("name", "").strip()
+        dob_str = clean_row.get("dob", "").strip()
+        email = clean_row.get("email", "").strip() or None
+        batch = clean_row.get("batch", "").strip() or None
+        reg_no = clean_row.get("reg_no", "").strip() or None
+        section = clean_row.get("section", "").strip().upper() or None
+        sem_str = clean_row.get("current_semester", "").strip()
+        
+        if not roll_no or not name or not dob_str:
+            errors.append(schemas.AdminStudentImportError(
+                row=row_num,
+                roll_no=roll_no or None,
+                error="Missing required fields: roll_no, name, or dob"
+            ))
+            failed_count += 1
+            continue
+            
+        current_semester = None
+        if sem_str:
+            try:
+                current_semester = int(sem_str)
+                if not (1 <= current_semester <= 12):
+                    errors.append(schemas.AdminStudentImportError(
+                        row=row_num,
+                        roll_no=roll_no,
+                        error=f"Semester must be between 1 and 12, got {current_semester}"
+                    ))
+                    failed_count += 1
+                    continue
+            except ValueError:
+                errors.append(schemas.AdminStudentImportError(
+                    row=row_num,
+                    roll_no=roll_no,
+                    error=f"Invalid semester format '{sem_str}', must be a number"
+                ))
+                failed_count += 1
+                continue
+                
+        try:
+            dob_val = parse_date(dob_str)
+        except ValueError as e:
+            errors.append(schemas.AdminStudentImportError(
+                row=row_num,
+                roll_no=roll_no,
+                error=str(e)
+            ))
+            failed_count += 1
+            continue
+            
+        # Check roll_no uniqueness
+        existing_student = await db.execute(
+            select(models.Student).filter(models.Student.roll_no == roll_no)
+        )
+        if existing_student.scalars().first():
+            errors.append(schemas.AdminStudentImportError(
+                row=row_num,
+                roll_no=roll_no,
+                error=f"Student with roll number '{roll_no}' already exists"
+            ))
+            failed_count += 1
+            continue
+            
+        username = roll_no.lower()
+        existing_user = await db.execute(
+            select(models.User).filter(models.User.username == username)
+        )
+        if existing_user.scalars().first():
+            errors.append(schemas.AdminStudentImportError(
+                row=row_num,
+                roll_no=roll_no,
+                error=f"Username '{username}' already exists"
+            ))
+            failed_count += 1
+            continue
+            
+        if reg_no:
+            existing_reg = await db.execute(
+                select(models.Student).filter(models.Student.reg_no == reg_no)
+            )
+            if existing_reg.scalars().first():
+                errors.append(schemas.AdminStudentImportError(
+                    row=row_num,
+                    roll_no=roll_no,
+                    error=f"Student with registration number '{reg_no}' already exists"
+                ))
+                failed_count += 1
+                continue
+                
+        # Create student user
+        try:
+            initial_password = dob_val.strftime("%d%m%Y")
+            hashed_pwd = auth.get_password_hash(initial_password)
+            
+            user = models.User(
+                username=username,
+                password_hash=hashed_pwd,
+                role_id=student_role.id,
+                is_initial_password=True,
+            )
+            db.add(user)
+            await db.flush()
+            
+            student = models.Student(
+                id=user.id,
+                roll_no=roll_no,
+                reg_no=reg_no,
+                name=name,
+                dob=dob_val,
+                email=email,
+                batch=batch,
+                section=section,
+                current_semester=current_semester,
+            )
+            db.add(student)
+            await db.flush()
+            success_count += 1
+        except Exception as e:
+            errors.append(schemas.AdminStudentImportError(
+                row=row_num,
+                roll_no=roll_no,
+                error=f"Database insertion error: {str(e)}"
+            ))
+            failed_count += 1
+            continue
+            
+    await db.commit()
+    
+    return schemas.AdminStudentImportResponse(
+        total_records=row_num - 1,
+        success_count=success_count,
+        failed_count=failed_count,
+        errors=errors
+    )
+
 
 @router.post("/assign-sections", response_model=schemas.MessageResponse)
 async def assign_student_sections(

@@ -1533,6 +1533,19 @@ class AdminStudentCreateResponse(BaseModel):
     section: Optional[str] = None
 
 
+class AdminStudentImportError(BaseModel):
+    row: int
+    roll_no: Optional[str] = None
+    error: str
+
+
+class AdminStudentImportResponse(BaseModel):
+    total_records: int
+    success_count: int
+    failed_count: int
+    errors: List[AdminStudentImportError] = Field(default_factory=list)
+
+
 class StaffCreate(BaseModel):
     username: str = Field(min_length=3, max_length=50, pattern=r'^[a-zA-Z0-9_.-]+$')
     password: str = Field(min_length=6, description="Password must be at least 6 characters")
